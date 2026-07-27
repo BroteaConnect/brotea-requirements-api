@@ -20,12 +20,13 @@ function rateLimited(ip) {
   return list.length > 5;
 }
 
-function send(res, status, body) {
+function send(res, status, body, headers = {}) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
+    ...headers,
   });
   res.end(JSON.stringify(body));
 }
@@ -91,11 +92,46 @@ async function handleSubmission(req, res) {
   return send(res, 201, { ok: true, id: ins.rows[0].id });
 }
 
+// Public read-only roadmap. Status derives from the linked feature when one
+// exists, so the roadmap can never drift from the real lifecycle.
+async function handleRoadmap(req, res, url) {
+  const project = url.searchParams.get('project') ?? '';
+  if (!SLUG_RE.test(project)) return send(res, 400, { error: 'invalid project' });
+
+  const { rows } = await pool.query(
+    'SELECT id, name FROM projects WHERE slug = $1',
+    [project],
+  );
+  if (!rows[0]) return send(res, 404, { error: 'unknown project' });
+
+  const items = await pool.query(
+    `SELECT r.id, r.title, r.description, r.shipped_at,
+            CASE
+              WHEN f.status IN ('implementing', 'in_review') THEN 'in_progress'
+              WHEN f.status = 'deployed' THEN 'shipped'
+              ELSE r.status::text
+            END AS status
+     FROM roadmap_items r
+     LEFT JOIN features f ON f.id = r.feature_id
+     WHERE r.project_id = $1
+       AND r.is_public
+       AND (f.status IS NULL OR f.status <> 'rejected')
+     ORDER BY r.sort_order, r.id`,
+    [rows[0].id],
+  );
+
+  return send(res, 200,
+    { project: { slug: project, name: rows[0].name }, items: items.rows },
+    { 'Cache-Control': 'public, max-age=60' });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
+    const url = new URL(req.url, 'http://localhost');
     if (req.method === 'OPTIONS') return send(res, 204, {});
-    if (req.method === 'GET' && req.url === '/health') return send(res, 200, { status: 'ok' });
-    if (req.method === 'POST' && req.url === '/requirements') return await handleSubmission(req, res);
+    if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok' });
+    if (req.method === 'GET' && url.pathname === '/roadmap') return await handleRoadmap(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/requirements') return await handleSubmission(req, res);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);
