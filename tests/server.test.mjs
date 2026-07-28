@@ -52,6 +52,20 @@ test('GET /roadmap allows cross-origin reads', async () => {
   assert.match(r.headers.get('access-control-allow-methods'), /GET/);
 });
 
+test('GET /garden is routed and allows cross-origin reads', async () => {
+  // The test DB is unreachable, so a 500 is expected — what matters here is
+  // that the route exists (not 404) and CORS headers are always present.
+  const r = await fetch(`${BASE}/garden`);
+  assert.notEqual(r.status, 404);
+  assert.equal(r.headers.get('access-control-allow-origin'), '*');
+  assert.equal(r.headers.get('content-type'), 'application/json');
+});
+
+test('POST /garden is not allowed', async () => {
+  const r = await fetch(`${BASE}/garden`, { method: 'POST' });
+  assert.equal(r.status, 404);
+});
+
 test('unknown route returns 404', async () => {
   const r = await fetch(`${BASE}/nope`);
   assert.equal(r.status, 404);
