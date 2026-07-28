@@ -125,12 +125,69 @@ async function handleRoadmap(req, res, url) {
     { 'Cache-Control': 'public, max-age=60' });
 }
 
+// Public read-only snapshot for the App Madre (arbol-madre): every project
+// with its creator, production URL and Telegram topic link, plus the recent
+// factory events the tree animates as sap pulses.
+const GARDEN_EVENTS = [
+  'project.created', 'feature.proposed', 'feature.analyzed', 'feature.approved',
+  'feature.implementation_started', 'feature.pr_opened', 'deployment.completed',
+  'docs.updated',
+];
+
+function topicUrl(topicId) {
+  if (!CHAT_ID || topicId == null) return null;
+  const short = String(CHAT_ID).replace(/^-100/, '');
+  return `https://t.me/c/${short}/${topicId}`;
+}
+
+async function handleGarden(req, res) {
+  const projects = await pool.query(
+    `SELECT p.slug, p.name, p.status, p.repo_url, p.created_at,
+            u.username AS creator, u.display_name AS creator_name,
+            t.topic_id,
+            (SELECT d.url FROM deployments d
+              WHERE d.project_id = p.id AND d.env = 'production'
+                AND d.status = 'succeeded' AND d.url IS NOT NULL
+              ORDER BY d.id DESC LIMIT 1) AS url,
+            (SELECT count(*)::int FROM features f
+              WHERE f.project_id = p.id
+                AND f.status NOT IN ('deployed','rejected')) AS open_features,
+            (SELECT count(*)::int FROM features f
+              WHERE f.project_id = p.id AND f.status = 'deployed') AS deployed_features
+       FROM projects p
+       LEFT JOIN LATERAL (
+         SELECT e.payload->>'ordered_by' AS tid FROM events e
+          WHERE e.event_type IN ('order.new_project', 'project.created')
+            AND e.payload->>'slug' = p.slug
+          ORDER BY e.id LIMIT 1
+       ) o ON true
+       LEFT JOIN users u ON u.telegram_id::text = o.tid
+       LEFT JOIN topics t ON t.project_id = p.id
+      ORDER BY p.created_at`,
+  );
+  const events = await pool.query(
+    `SELECT id, event_type,
+            COALESCE(payload->>'project', payload->>'slug') AS project,
+            created_at
+       FROM events
+      WHERE event_type = ANY($1)
+      ORDER BY id DESC LIMIT 40`,
+    [GARDEN_EVENTS],
+  );
+  return send(res, 200, {
+    generated_at: new Date().toISOString(),
+    projects: projects.rows.map(({ topic_id, ...p }) => ({ ...p, topic_url: topicUrl(topic_id) })),
+    events: events.rows,
+  }, { 'Cache-Control': 'public, max-age=10' });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok' });
     if (req.method === 'GET' && url.pathname === '/roadmap') return await handleRoadmap(req, res, url);
+    if (req.method === 'GET' && url.pathname === '/garden') return await handleGarden(req, res);
     if (req.method === 'POST' && url.pathname === '/requirements') return await handleSubmission(req, res);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
