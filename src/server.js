@@ -202,13 +202,25 @@ async function handleBrevoWebhook(req, res, url) {
   if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
   const data = await readJson(req, res);
   if (!data) return undefined;
+  let result;
   try {
-    const result = await applyBrevoEvent(data);
-    return send(res, 200, { ok: true, ...result });
+    result = await applyBrevoEvent(data);
   } catch (e) {
     console.error('brevo webhook failed:', e.message);
-    return send(res, 200, { ok: false, error: e.message.slice(0, 200) }); // 200: no reintentos infinitos
+    result = { error: e.message.slice(0, 200) };
   }
+  // Toda llamada entrante deja rastro: sin esto es imposible distinguir
+  // "el proveedor no llama" de "llama y no encaja" (nos costó una tarde).
+  pool.query(
+    'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
+    ['brevo', 'email.event_received', {
+      event: data.event ?? null,
+      message_id: data['message-id'] ?? null,
+      email: data.email ?? null,
+      result,
+    }],
+  ).catch((e) => console.error('event log failed:', e.message));
+  return send(res, 200, { ok: !result.error, ...result }); // 200 siempre: sin reintentos infinitos
 }
 
 // Public read-only roadmap. Status derives from the linked feature when one
