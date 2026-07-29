@@ -14,6 +14,7 @@ before(async () => {
       ...process.env,
       PORT: String(PORT),
       DATABASE_URL: 'postgres://unused:unused@127.0.0.1:1/unused',
+      GLITCHTIP_WEBHOOK_SECRET: 'test-secret',
     },
     stdio: 'ignore',
   });
@@ -68,5 +69,44 @@ test('POST /garden is not allowed', async () => {
 
 test('unknown route returns 404', async () => {
   const r = await fetch(`${BASE}/nope`);
+  assert.equal(r.status, 404);
+});
+
+test('POST /glitchtip-webhook without secret is forbidden', async () => {
+  const r = await fetch(`${BASE}/glitchtip-webhook?project=demo`, {
+    method: 'POST',
+    body: '{}',
+  });
+  assert.equal(r.status, 403);
+});
+
+test('POST /glitchtip-webhook with wrong secret is forbidden', async () => {
+  const r = await fetch(`${BASE}/glitchtip-webhook?project=demo&secret=nope`, {
+    method: 'POST',
+    body: '{}',
+  });
+  assert.equal(r.status, 403);
+});
+
+test('POST /glitchtip-webhook with invalid slug is rejected', async () => {
+  const r = await fetch(`${BASE}/glitchtip-webhook?project=Not%20A%20Slug!&secret=test-secret`, {
+    method: 'POST',
+    body: '{}',
+  });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: 'invalid project' });
+});
+
+test('POST /glitchtip-webhook with invalid JSON is rejected', async () => {
+  const r = await fetch(`${BASE}/glitchtip-webhook?project=demo&secret=test-secret`, {
+    method: 'POST',
+    body: 'not json',
+  });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: 'invalid JSON' });
+});
+
+test('GET /glitchtip-webhook is not routed', async () => {
+  const r = await fetch(`${BASE}/glitchtip-webhook?project=demo&secret=test-secret`);
   assert.equal(r.status, 404);
 });

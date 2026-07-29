@@ -31,20 +31,27 @@ function send(res, status, body, headers = {}) {
   res.end(JSON.stringify(body));
 }
 
-async function notifyTopic(projectId, projectName, content, submittedBy) {
+async function sendToProjectTopic(projectId, text) {
   if (!BOT_TOKEN || !CHAT_ID) return;
   const { rows } = await pool.query(
     'SELECT topic_id FROM topics WHERE project_id = $1',
     [projectId],
   );
   if (!rows[0]) return;
-  const excerpt = content.length > 300 ? `${content.slice(0, 300)}…` : content;
   const params = new URLSearchParams({
     chat_id: CHAT_ID,
     message_thread_id: String(rows[0].topic_id),
-    text: `📥 Nuevo requisito para ${projectName} (de ${submittedBy}):\n"${excerpt}"`,
+    text,
   });
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?${params}`);
+}
+
+function notifyTopic(projectId, projectName, content, submittedBy) {
+  const excerpt = content.length > 300 ? `${content.slice(0, 300)}…` : content;
+  return sendToProjectTopic(
+    projectId,
+    `📥 Nuevo requisito para ${projectName} (de ${submittedBy}):\n"${excerpt}"`,
+  );
 }
 
 async function handleSubmission(req, res) {
@@ -90,6 +97,50 @@ async function handleSubmission(req, res) {
     .catch((e) => console.error('notify failed:', e.message));
 
   return send(res, 201, { ok: true, id: ins.rows[0].id });
+}
+
+// GlitchTip alert webhook → the project's Telegram topic. GlitchTip has no
+// Telegram integration, so each project's alert rule points its webhook
+// recipient here with ?project=<slug>&secret=<shared>. The secret gates the
+// endpoint (it is public otherwise) and lives in GLITCHTIP_WEBHOOK_SECRET.
+const GT_WEBHOOK_SECRET = process.env.GLITCHTIP_WEBHOOK_SECRET;
+
+async function handleGlitchtipAlert(req, res, url) {
+  if (!GT_WEBHOOK_SECRET) return send(res, 503, { error: 'webhook not configured' });
+  if (url.searchParams.get('secret') !== GT_WEBHOOK_SECRET) return send(res, 403, { error: 'forbidden' });
+  const project = url.searchParams.get('project') ?? '';
+  if (!SLUG_RE.test(project)) return send(res, 400, { error: 'invalid project' });
+
+  let raw = '';
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > MAX_BODY) return send(res, 413, { error: 'body too large' });
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return send(res, 400, { error: 'invalid JSON' });
+  }
+
+  // GlitchTip posts a Slack-shaped payload; extract best-effort.
+  const att = (Array.isArray(data.attachments) && data.attachments[0]) || {};
+  const title = String(att.title || data.text || 'error').slice(0, 300);
+  const link = typeof att.title_link === 'string' ? att.title_link.slice(0, 500) : '';
+
+  const { rows } = await pool.query('SELECT id, name FROM projects WHERE slug = $1', [project]);
+  if (!rows[0]) return send(res, 404, { error: 'unknown project' });
+
+  await pool.query(
+    'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
+    ['requirements-api', 'error.alerted', { project, title }],
+  );
+  sendToProjectTopic(
+    rows[0].id,
+    `🐞 Error en producción — ${rows[0].name}\n"${title}"${link ? `\n${link}` : ''}`,
+  ).catch((e) => console.error('notify failed:', e.message));
+
+  return send(res, 200, { ok: true });
 }
 
 // Public read-only roadmap. Status derives from the linked feature when one
@@ -189,6 +240,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/roadmap') return await handleRoadmap(req, res, url);
     if (req.method === 'GET' && url.pathname === '/garden') return await handleGarden(req, res);
     if (req.method === 'POST' && url.pathname === '/requirements') return await handleSubmission(req, res);
+    if (req.method === 'POST' && url.pathname === '/glitchtip-webhook') return await handleGlitchtipAlert(req, res, url);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);
