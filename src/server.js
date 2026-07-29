@@ -1,5 +1,6 @@
 import http from 'node:http';
 import pg from 'pg';
+import { sendTrackedEmail, applyBrevoEvent, emailConfigured } from './email.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const PORT = Number(process.env.PORT ?? 3000);
@@ -143,6 +144,73 @@ async function handleGlitchtipAlert(req, res, url) {
   return send(res, 200, { ok: true });
 }
 
+// Outbound email for CRMs: the browser must never hold SMTP credentials, so
+// the CRM posts here with the shared secret. Delivery tracking arrives later
+// via /brevo-webhook and lands on the same activity record.
+const OUTBOUND_SECRET = process.env.OUTBOUND_SECRET;
+
+async function readJson(req, res) {
+  let raw = '';
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > MAX_BODY) { send(res, 413, { error: 'body too large' }); return null; }
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    send(res, 400, { error: 'invalid JSON' });
+    return null;
+  }
+}
+
+async function handleSendEmail(req, res, url) {
+  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'outbound email not configured' });
+  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+
+  const data = await readJson(req, res);
+  if (!data) return undefined;
+  const to = String(data.to ?? '').trim();
+  const subject = String(data.subject ?? '').trim();
+  const text = String(data.text ?? '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) return send(res, 400, { error: 'invalid to' });
+  if (!subject || !text) return send(res, 400, { error: 'subject and text required' });
+  // La configuración se comprueba tras validar: una petición mal formada es
+  // un 400 aunque el relay no esté montado.
+  if (!emailConfigured()) return send(res, 503, { error: 'smtp not configured' });
+
+  try {
+    const out = await sendTrackedEmail({
+      to, subject, text,
+      leadId: data.lead_id ? String(data.lead_id) : null,
+      fromName: data.from_name ? String(data.from_name).slice(0, 100) : null,
+    });
+    await pool.query(
+      'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
+      ['requirements-api', 'email.sent', { to, subject, lead_id: data.lead_id ?? null }],
+    );
+    return send(res, 200, { ok: true, ...out });
+  } catch (e) {
+    console.error('send-email failed:', e.message);
+    return send(res, 502, { error: 'send failed', detail: e.message.slice(0, 200) });
+  }
+}
+
+// Brevo delivery events (delivered / opened / click / bounce…). Brevo cannot
+// send custom headers, so the shared secret travels in the query string.
+async function handleBrevoWebhook(req, res, url) {
+  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
+  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const data = await readJson(req, res);
+  if (!data) return undefined;
+  try {
+    const result = await applyBrevoEvent(data);
+    return send(res, 200, { ok: true, ...result });
+  } catch (e) {
+    console.error('brevo webhook failed:', e.message);
+    return send(res, 200, { ok: false, error: e.message.slice(0, 200) }); // 200: no reintentos infinitos
+  }
+}
+
 // Public read-only roadmap. Status derives from the linked feature when one
 // exists, so the roadmap can never drift from the real lifecycle.
 async function handleRoadmap(req, res, url) {
@@ -241,6 +309,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/garden') return await handleGarden(req, res);
     if (req.method === 'POST' && url.pathname === '/requirements') return await handleSubmission(req, res);
     if (req.method === 'POST' && url.pathname === '/glitchtip-webhook') return await handleGlitchtipAlert(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/send-email') return await handleSendEmail(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/brevo-webhook') return await handleBrevoWebhook(req, res, url);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);

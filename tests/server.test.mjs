@@ -15,6 +15,7 @@ before(async () => {
       PORT: String(PORT),
       DATABASE_URL: 'postgres://unused:unused@127.0.0.1:1/unused',
       GLITCHTIP_WEBHOOK_SECRET: 'test-secret',
+      OUTBOUND_SECRET: 'test-outbound',
     },
     stdio: 'ignore',
   });
@@ -109,4 +110,50 @@ test('POST /glitchtip-webhook with invalid JSON is rejected', async () => {
 test('GET /glitchtip-webhook is not routed', async () => {
   const r = await fetch(`${BASE}/glitchtip-webhook?project=demo&secret=test-secret`);
   assert.equal(r.status, 404);
+});
+
+test('POST /send-email without secret is forbidden', async () => {
+  const r = await fetch(`${BASE}/send-email`, { method: 'POST', body: '{}' });
+  assert.equal(r.status, 403);
+});
+
+test('POST /send-email rejects an invalid recipient', async () => {
+  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
+    method: 'POST',
+    body: JSON.stringify({ to: 'not-an-email', subject: 'x', text: 'y' }),
+  });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: 'invalid to' });
+});
+
+test('POST /send-email requires subject and text', async () => {
+  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
+    method: 'POST',
+    body: JSON.stringify({ to: 'alguien@example.com', subject: '', text: '' }),
+  });
+  assert.equal(r.status, 400);
+});
+
+test('POST /send-email without SMTP config reports it', async () => {
+  // El entorno de test no trae SMTP_*: debe fallar limpio, no 500.
+  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
+    method: 'POST',
+    body: JSON.stringify({ to: 'alguien@example.com', subject: 'hola', text: 'texto' }),
+  });
+  assert.equal(r.status, 503);
+});
+
+test('POST /brevo-webhook without secret is forbidden', async () => {
+  const r = await fetch(`${BASE}/brevo-webhook`, { method: 'POST', body: '{}' });
+  assert.equal(r.status, 403);
+});
+
+test('POST /brevo-webhook ignores events it does not map', async () => {
+  const r = await fetch(`${BASE}/brevo-webhook?secret=test-outbound`, {
+    method: 'POST',
+    body: JSON.stringify({ event: 'request', 'message-id': '<x@brotea.dev>' }),
+  });
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.skipped, true);
 });
