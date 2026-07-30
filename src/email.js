@@ -60,12 +60,22 @@ async function pb(method, path, body) {
  * Send one email and record it as a lead activity.
  * Returns { message_id, activity_id }.
  */
-export async function sendTrackedEmail({ to, subject, text, leadId, fromName }) {
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+/** Plain text → simple HTML. Open tracking needs an HTML part: the provider
+ *  injects its pixel there, so a text-only email is untrackable by design. */
+const textoAHtml = (text) =>
+  `<!doctype html><html><body style="font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:15px;line-height:1.55;color:#09092d">` +
+  text.split(/\n{2,}/).map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`).join('') +
+  `</body></html>`;
+
+export async function sendTrackedEmail({ to, subject, text, leadId, fromName, html }) {
   // Our own Message-ID is the join key with Brevo's webhook events.
   const messageId = `<lead-${leadId ?? 'na'}-${randomBytes(8).toString('hex')}@brotea.dev>`;
   const info = await getTransport().sendMail({
     from: fromName ? `${fromName} <${MAIL_FROM}>` : MAIL_FROM,
     to, subject, text, messageId,
+    html: html || textoAHtml(text),
     // Brevo relays these as its own tracking tags.
     headers: { 'X-Mailin-custom': `lead:${leadId ?? ''}` },
   });
