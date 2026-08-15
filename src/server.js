@@ -1,4 +1,6 @@
 import http from 'node:http';
+import path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
 import { sendTrackedEmail, applyBrevoEvent, emailConfigured } from './email.js';
 
@@ -312,11 +314,44 @@ async function handleGarden(req, res) {
   }, { 'Cache-Control': 'public, max-age=10' });
 }
 
+// -- assets ------------------------------------------------------------------
+// The brand images the transactional emails point at. An inbox has no base URL
+// and cannot read a relative path, so the templates carry an absolute https one
+// — and this is the only host in the fleet that is ours, monitored, and not
+// somebody's project site.
+//
+// Read from disk on every request rather than cached in memory: these are two
+// files of a few KB behind a CDN-less nginx, and a stale logo in an email that
+// has already been sent cannot be fixed by a restart anyway.
+const ASSET_DIR = new URL('../assets/', import.meta.url).pathname;
+const ASSET_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml' };
+
+function handleAsset(req, res, url) {
+  // No traversal: the path is rebuilt from its own basename, so '..' cannot
+  // survive it and neither can a symlink somebody drops in the folder.
+  const rel = url.pathname.replace(/^\/assets\//, '');
+  const parts = rel.split('/').filter((p) => p && p !== '.' && p !== '..');
+  const file = path.join(ASSET_DIR, ...parts);
+  const type = ASSET_TYPES[path.extname(file).toLowerCase()];
+  if (!type || !file.startsWith(ASSET_DIR) || !existsSync(file)) return send(res, 404, { error: 'not found' });
+  const body = readFileSync(file);
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': body.length,
+    // A logo in an email is fetched once per reader and never changes without
+    // changing its name.
+    'Cache-Control': 'public, max-age=604800, immutable',
+    'Access-Control-Allow-Origin': '*',
+  });
+  return res.end(body);
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'OPTIONS') return send(res, 204, {});
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok' });
+    if (req.method === 'GET' && url.pathname.startsWith('/assets/')) return handleAsset(req, res, url);
     if (req.method === 'GET' && url.pathname === '/roadmap') return await handleRoadmap(req, res, url);
     if (req.method === 'GET' && url.pathname === '/garden') return await handleGarden(req, res);
     if (req.method === 'POST' && url.pathname === '/requirements') return await handleSubmission(req, res);
