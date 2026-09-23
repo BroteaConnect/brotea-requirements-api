@@ -179,6 +179,19 @@ test('POST /send-email with a plantilla and no lead_id → 400 lead_required', a
   assert.equal(body.error.text, t('es', 'refusal.lead_required'));
 });
 
+test('POST /send-email with a campana_id that is not an id → 400 campana_invalid, nothing sent', async () => {
+  const before = events().length;
+  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
+    method: 'POST', headers: json,
+    body: JSON.stringify({ lead_id: 'abcdefghijklmno', subject: 'hola', text: 'texto', campana_id: 'not-a-campaign' }),
+  });
+  assert.equal(r.status, 400);
+  const body = await r.json();
+  assert.equal(body.ok, false);
+  assert.deepEqual(body.error, { code: 'campana_invalid', text: t('es', 'refusal.campana_invalid') });
+  assert.equal(events().slice(before).some((e) => e.type === 'email.sent'), false);
+});
+
 test('POST /content/submit needs a clave; /content/sync accepts an empty body', async () => {
   const r = await fetch(`${BASE}/content/submit?secret=test-outbound`, { method: 'POST', headers: json, body: '{}' });
   assert.equal(r.status, 400);

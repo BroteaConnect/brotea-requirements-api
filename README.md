@@ -119,6 +119,15 @@ stops being recorded.
   (`canal: email`, `mensaje_id` = our Message-ID, `estado: enviado`). Answers
   `{ok, message_id, activity_id, envio_id}`.
 
+  An optional `campana_id` (either shape) stamps `campana` on both rows, as
+  `/send-whatsapp` does, and adds `campana_id` to the `email.sent` event. It
+  must be a PocketBase id (15 alphanumerics) naming an existing `campanas`
+  row, or the request is refused 400 `campana_invalid` before anything is
+  sent. Unlike WhatsApp, whose rows are written before the send, an email's
+  rows are written after it, so the campaign is read first rather than left
+  to PocketBase's relation check. Without `campana_id` nothing changes: no
+  extra read, no `campana` key on either row.
+
   **The recipient is never read from the request.** A `to` in the body is
   ignored; the address comes from the `leads` row named by `lead_id`, which is
   required (400 `lead_required` without it, 404 `lead_unknown` for a lead that

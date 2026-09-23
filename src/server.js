@@ -2,7 +2,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
-import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb, resolveLeadEmail, resolveTemplateEmail } from './email.js';
+import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb, resolveLeadEmail, resolveTemplateEmail, resolveCampaign } from './email.js';
 import { assignWebLead } from './assign.js';
 import { t } from './copy.js';
 import { twilioCaller, validSignature, whatsappAddress } from './twilio.js';
@@ -270,7 +270,8 @@ const refusal = (res, status, code, vars) => send(res, status, { ok: false, erro
  * Two shapes, both naming a lead and neither naming an address:
  * {lead_id, subject, text} for free text the agent wrote, and
  * {lead_id, plantilla, variables}, which resolves subject and body from the
- * `plantillas` row in the lead's language. Both may carry from_name.
+ * `plantillas` row in the lead's language. Both may carry from_name, and
+ * campana_id, which the activity and the envios row then carry.
  *
  * `to` is no longer part of either. It used to be, and an arbitrary recipient
  * plus a credential that shipped inside a public JS bundle is an open mail
@@ -296,6 +297,9 @@ async function handleSendEmail(req, res, url) {
 
   if (!leadId) return refusal(res, 400, 'lead_required');
   if (!pbConfigured()) return send(res, 503, { error: 'pocketbase not configured' });
+  const campaign = await resolveCampaign(data.campana_id, { pb });
+  if (campaign.code) return refusal(res, campaign.status, campaign.code);
+  const { campanaId } = campaign;
 
   if (clave) {
     const resolved = await resolveTemplateEmail(
@@ -318,11 +322,11 @@ async function handleSendEmail(req, res, url) {
 
   try {
     const out = await sendTrackedEmail({
-      to, subject, text, leadId, fromName, idioma,
+      to, subject, text, leadId, fromName, idioma, campanaId,
       plantilla: plantilla?.id ?? null, plantillaVersion: plantilla?.version ?? null, variables: values,
       bajaUrl: leadId && PUBLIC_URL && bajaSecret() ? bajaUrl(PUBLIC_URL, leadId, bajaSecret()) : null,
     });
-    await logEvent('email.sent', { to, subject, lead_id: leadId, envio_id: out.envio_id, plantilla: clave || null });
+    await logEvent('email.sent', { to, subject, lead_id: leadId, envio_id: out.envio_id, plantilla: clave || null, ...(campanaId ? { campana_id: campanaId } : {}) });
     return send(res, 200, { ok: true, ...out });
   } catch (e) {
     console.error('send-email failed:', e.message);
