@@ -2,15 +2,14 @@ import http from 'node:http';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
-import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb } from './email.js';
+import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb, resolveTemplateEmail } from './email.js';
 import { assignWebLead } from './assign.js';
-import { locale, t } from './copy.js';
-import { loadTemplate, missingVariables, render, variableNames } from './templates.js';
+import { t } from './copy.js';
 import { twilioCaller, validSignature, whatsappAddress } from './twilio.js';
 import { applyTwilioStatus, sendWhatsapp } from './whatsapp.js';
 import { submitContent, syncContent } from './content.js';
-import { bajaUrl, revokeByEmail, validBajaToken } from './consent.js';
-import { bajaPage } from './baja.js';
+import { bajaUrl, grantByEmail, revokeByEmail, validBajaToken, validSiToken } from './consent.js';
+import { bajaPage, siPage } from './baja.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const PORT = Number(process.env.PORT ?? 3000);
@@ -241,26 +240,13 @@ async function handleSendEmail(req, res, url) {
   if (clave) {
     if (!leadId) return refusal(res, 400, 'lead_required');
     if (!pbConfigured()) return send(res, 503, { error: 'pocketbase not configured' });
-    let lead;
-    try {
-      lead = await pb('GET', `/api/collections/leads/records/${encodeURIComponent(leadId)}`);
-    } catch (e) {
-      if (e.status === 404) return refusal(res, 404, 'lead_unknown');
-      throw e;
-    }
-    const loaded = await loadTemplate(pb, clave, 'email');
-    if (loaded.code) return refusal(res, loaded.code === 'template_unknown' ? 404 : loaded.code === 'template_retired' ? 422 : 400, loaded.code, { canal: 'email' });
-    plantilla = loaded.plantilla;
-    to = String(lead.email ?? '').trim();
-    if (!EMAIL_RE.test(to)) return refusal(res, 400, 'no_email');
-    if (plantilla.categoria === 'marketing' && !lead.consentimiento) return refusal(res, 422, 'no_consent');
-    idioma = locale(lead.idioma);
-    const names = variableNames(plantilla);
-    values = { nombre: lead.nombre || '', ...(data.variables && typeof data.variables === 'object' ? data.variables : {}) };
-    const missing = missingVariables(names, values);
-    if (missing.length) return refusal(res, 400, 'variables_missing', { names: missing.join(', ') });
-    subject = render(plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '', values).trim();
-    text = render(plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '', values).trim();
+    const resolved = await resolveTemplateEmail(
+      { leadId, clave, given: data.variables },
+      { pb, publicUrl: PUBLIC_URL, secret: bajaSecret() },
+    );
+    if (resolved.code) return refusal(res, resolved.status, resolved.code, resolved.vars);
+    ({ to, subject, text, idioma, values } = resolved);
+    plantilla = resolved.plantilla;
   }
   if (!EMAIL_RE.test(to)) return send(res, 400, { error: 'invalid to' });
   if (!subject || !text) return send(res, 400, { error: 'subject and text required' });
@@ -366,6 +352,42 @@ async function handleBaja(req, res, url) {
     return page(e.status === 404 ? 403 : 502, 'invalid');
   }
   return page(200, 'done');
+}
+
+// The opt-in link of the consent campaign (CU-15), the mirror of /baja and
+// gated the same way: a GET only shows the button, a POST does the write.
+// The reason is the same one in reverse — a mail scanner follows every link in
+// an email, and consent that a scanner gave is not consent. The confirmation
+// is rendered in the lead's own language, and the write is what tells us
+// which one that is.
+async function handleSi(req, res, url) {
+  const page = (status, result, options) => {
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(siPage(result, options));
+  };
+  let leadId; let token;
+  if (req.method === 'GET') {
+    leadId = url.searchParams.get('lead') ?? '';
+    token = url.searchParams.get('t') ?? '';
+  } else {
+    const form = await readForm(req, res);
+    if (!form) return undefined;
+    leadId = form.lead ?? '';
+    token = form.t ?? '';
+  }
+  // The same page whether the token is wrong or the lead does not exist: this
+  // endpoint never tells a stranger which lead ids are real.
+  if (!bajaSecret() || !validSiToken(leadId, token, bajaSecret())) return page(403, 'invalid');
+  if (req.method === 'GET') return page(200, 'ask', { form: { lead: leadId, t: token } });
+  if (!pbConfigured()) return page(503, 'invalid');
+  let out;
+  try {
+    out = await grantByEmail(leadId, { pb, logEvent: logChassis });
+  } catch (e) {
+    console.error('si failed:', e.message);
+    return page(e.status === 404 ? 403 : 502, 'invalid');
+  }
+  return page(200, 'done', { idioma: out.idioma });
 }
 
 // Brevo delivery events (delivered / opened / click / bounce…). Brevo cannot
@@ -534,6 +556,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/content/submit') return await handleContent(req, res, url, 'submit');
     if (req.method === 'POST' && url.pathname === '/content/sync') return await handleContent(req, res, url, 'sync');
     if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/baja') return await handleBaja(req, res, url);
+    if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/si') return await handleSi(req, res, url);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);

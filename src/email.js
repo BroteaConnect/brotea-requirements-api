@@ -9,6 +9,8 @@
 import { createTransport } from 'nodemailer';
 import { randomBytes } from 'node:crypto';
 import { locale, t } from './copy.js';
+import { consentGate, linkVariables } from './consent.js';
+import { loadTemplate, missingVariables, render, variableNames } from './templates.js';
 import { RANK, moves } from './twilio.js';
 
 const SMTP_HOST = process.env.SMTP_HOST;
@@ -83,6 +85,61 @@ const textoAHtml = (text) =>
   `<!doctype html><html><body style="font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:15px;line-height:1.55;color:#09092d">` +
   text.split(/\n{2,}/).map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`).join('') +
   `</body></html>`;
+
+// -- a `plantillas` row for one lead -----------------------------------------
+// Everything POST /send-email needs to resolve {lead_id, plantilla,
+// variables} into a message, with no environment of its own: the server hands
+// in `pb` and the public origin, so the whole decision runs in a test.
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const REFUSAL_STATUS = {
+  lead_required: 400, lead_unknown: 404, template_unknown: 404, template_channel: 400,
+  template_retired: 422, no_email: 400, no_consent: 422, consent_revoked: 422, variables_missing: 400,
+};
+const refuse = (code, vars) => ({ code, status: REFUSAL_STATUS[code] ?? 400, vars });
+
+/**
+ * Resolve a template send for a lead: {to, subject, text, idioma, plantilla,
+ * values} when it may go out, {code, status, vars} when it may not.
+ */
+export async function resolveTemplateEmail({ leadId, clave, given }, { pb: pbCall, publicUrl, secret }) {
+  if (!leadId) return refuse('lead_required');
+  let lead;
+  try {
+    lead = await pbCall('GET', `/api/collections/leads/records/${encodeURIComponent(leadId)}`);
+  } catch (e) {
+    if (e.status === 404) return refuse('lead_unknown');
+    throw e;
+  }
+  const loaded = await loadTemplate(pbCall, clave, 'email');
+  if (loaded.code) return refuse(loaded.code, { canal: 'email' });
+  const plantilla = loaded.plantilla;
+  const to = String(lead.email ?? '').trim();
+  if (!EMAIL_RE.test(to)) return refuse('no_email');
+  const gate = consentGate(plantilla, lead);
+  if (gate) return refuse(gate);
+
+  const idioma = locale(lead.idioma);
+  const names = variableNames(plantilla);
+  const values = {
+    nombre: lead.nombre || '',
+    ...(given && typeof given === 'object' ? given : {}),
+    // Deliberately last, and security-relevant: the opt-out and opt-in links
+    // are signed with a secret only the chassis holds, so a caller can never
+    // be asked for them — and must never be able to substitute its own.
+    ...linkVariables(names, { publicUrl, leadId, secret }),
+  };
+  // A link we cannot mint (no public origin, no secret) stays missing: the
+  // refusal names it, rather than a body reaching an inbox with a literal
+  // {{baja_url}} in it.
+  const missing = missingVariables(names, values);
+  if (missing.length) return refuse('variables_missing', { names: missing.join(', ') });
+
+  return {
+    to, plantilla, idioma, values,
+    subject: render(plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '', values).trim(),
+    text: render(plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '', values).trim(),
+  };
+}
 
 /**
  * Send one email, record it as a lead activity and as an `envios` row.

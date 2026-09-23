@@ -10,6 +10,7 @@
 // A refusal (4xx) leaves no row and one whatsapp.refused event. A provider
 // error leaves the rows in `error` with the code verbatim in error_codigo.
 import { has, locale, t } from './copy.js';
+import { consentGate } from './consent.js';
 import { leadPhoneE164 } from './phone.js';
 import { loadTemplate, missingVariables, pbQuote, pick, positional, render, variableNames } from './templates.js';
 import { BODY_MAX, STATUS_MAP, buildSendMessage, moves, parseStatusCallback, twilioError } from './twilio.js';
@@ -20,7 +21,7 @@ const LEDGER_LOCALE = 'es';
 const REFUSAL_STATUS = {
   lead_required: 400, lead_unknown: 404, template_unknown: 404, template_channel: 400,
   template_retired: 422, template_required: 400, variables_missing: 400, text_too_long: 400,
-  no_phone: 422, no_consent: 422, outside_window: 422, template_not_approved: 422, actividad_invalid: 400,
+  no_phone: 422, no_consent: 422, consent_revoked: 422, outside_window: 422, template_not_approved: 422, actividad_invalid: 400,
 };
 const PB_ID = /^[a-z0-9]{15}$/i;
 
@@ -96,7 +97,11 @@ export async function sendWhatsapp(input, { pb, twilio, logEvent, now = new Date
 
   const to = leadPhoneE164(lead.telefono);
   if (!to) return refuse('no_phone');
-  if (plantilla?.categoria === 'marketing' && !lead.consentimiento) return refuse('no_consent');
+  // The same gate as the email path, from the same module: marketing needs
+  // consent, the consent request itself does not, and nobody who opted out is
+  // written to. Outside the window Meta's approval still applies on top.
+  const gate = consentGate(plantilla, lead);
+  if (gate) return refuse(gate);
 
   const window = await insideWindow(pb, leadId, now);
   const names = plantilla ? variableNames(plantilla) : [];

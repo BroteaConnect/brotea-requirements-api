@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { signature } from '../src/twilio.js';
-import { bajaToken } from '../src/consent.js';
+import { bajaToken, siToken } from '../src/consent.js';
 import { t } from '../src/copy.js';
 
 const PORT = 3997;
@@ -137,6 +137,38 @@ test('POST /baja does the write: 403 on a bad token, and the good token reaches 
   const good = await fetch(`${BASE}/baja`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: bajaToken('lead1', 'test-outbound') }) });
   assert.equal(good.status, 502, 'the token passed; PocketBase is what failed');
   assert.ok((await good.text()).includes(t('es', 'baja_invalid')));
+});
+
+test('GET /si is the mirror of /baja: a bad token → 403, the baja token → 403, its own token shows the button', async () => {
+  const bad = await fetch(`${BASE}/si?lead=lead1&t=nope`);
+  assert.equal(bad.status, 403);
+  assert.match(bad.headers.get('content-type'), /text\/html/);
+  const html = await bad.text();
+  assert.ok(html.includes(t('es', 'si_invalid')) && html.includes(t('en', 'si_invalid')));
+  assert.match(html, /--color-bg:/);
+  assert.doesNotMatch(html, /<form/);
+  // The link that opts a lead out must never opt them in.
+  const crossed = await fetch(`${BASE}/si?lead=lead1&t=${bajaToken('lead1', 'test-outbound')}`);
+  assert.equal(crossed.status, 403);
+  const token = siToken('lead1', 'test-outbound');
+  const good = await fetch(`${BASE}/si?lead=lead1&t=${token}`);
+  assert.equal(good.status, 200, 'a GET never touches PocketBase (which is down here)');
+  const page = await good.text();
+  assert.ok(page.includes(t('es', 'si_ask')) && page.includes(t('en', 'si_ask')));
+  assert.ok(page.includes(t('es', 'si_confirm')));
+  assert.match(page, /<form method="post" action="\/si">/);
+  assert.match(page, new RegExp(`name="t" value="${token}"`));
+  assert.match(page, /name="lead" value="lead1"/);
+});
+
+test('POST /si does the write: 403 on a bad token or the baja one, and its own token reaches PocketBase', async () => {
+  const bad = await fetch(`${BASE}/si`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: 'nope' }) });
+  assert.equal(bad.status, 403);
+  const crossed = await fetch(`${BASE}/si`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: bajaToken('lead1', 'test-outbound') }) });
+  assert.equal(crossed.status, 403);
+  const good = await fetch(`${BASE}/si`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: siToken('lead1', 'test-outbound') }) });
+  assert.equal(good.status, 502, 'the token passed; PocketBase is what failed');
+  assert.ok((await good.text()).includes(t('es', 'si_invalid')));
 });
 
 test('POST /send-email with a plantilla and no lead_id → 400 lead_required', async () => {
