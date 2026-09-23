@@ -26,9 +26,16 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   from_name?}`; or `{lead_id, plantilla, variables?, from_name?}`, which
   resolves the address from the lead, the subject and body from the
   `plantillas` row (`asunto_<idioma>` / `cuerpo_<idioma>`, `{{nombre}}` filled
-  from the lead) and refuses a `marketing` template without consent (422
-  `no_consent`). With a `lead_id` the opt-out footer (`/baja` link) is appended
-  in the lead's language. Writes the `actividades` row and an `envios` row
+  from the lead) and applies the consent gate below (422 `no_consent` /
+  `consent_revoked`). The signed links a body uses — `{{baja_url}}`,
+  `{{si_url}}` — are filled in by the chassis, which alone holds the secret:
+  a caller never supplies them, and a value it sends for one of those names
+  is dropped before anything is rendered. Neither link is ever stored: the
+  `actividades` note and the `envios` variables keep `[si_url]` in its place,
+  because a signed link is a bearer credential and those rows are readable by
+  every signed-in CRM user. With a
+  `lead_id` the opt-out footer (`/baja` link) is appended in the lead's
+  language. Writes the `actividades` row and an `envios` row
   (`canal: email`, `mensaje_id` = our Message-ID, `estado: enviado`). Answers
   `{ok, message_id, activity_id, envio_id}`.
 - `POST /brevo-webhook?secret=` — Brevo's delivery events. Updates the
@@ -64,6 +71,10 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   `{ok:false, error:{code, class, text}}` with class `provider_auth`,
   `sender_not_ready`, `template_invalid`, `already_submitted` (409) or
   `provider_unavailable`.
+  A resubmission after Meta judged a template (`rejected`, `paused`,
+  `disabled`) is refused with class `version_unchanged` (409) until the
+  row's `version` moves past the one in the existing Content's name; a
+  Content whose approval request failed is reused, not recreated.
 - `POST /content/sync` — `{clave?}`: reads every submitted row's approval
   state back from `ContentAndApprovals`, PATCHes only what changed (state and
   `content_motivo` from Meta's `rejection_reason`) and answers
@@ -75,10 +86,17 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   `leads.consentimiento = false` with the date and the text, logs
   `lead.consent_revoked {lead_id, via:'email'}`, and shows the confirmation
   in both languages. A bad token is a 403 page on either verb.
-  A resubmission after Meta judged a template (`rejected`, `paused`,
-  `disabled`) is refused with class `version_unchanged` (409) until the
-  row's `version` moves past the one in the existing Content's name; a
-  Content whose approval request failed is reused, not recreated.
+- `GET /si?lead=&t=` — the opt-in link of the consent campaign, the mirror of
+  `/baja` with its own token (HMAC-SHA256 of `si:<lead id>`, so neither token
+  works on the other route). GET only shows a one-button page for the same
+  reason — consent a mail scanner gave is not consent; `POST /si` sets
+  `leads.consentimiento = true` with the date and the copy that was shown,
+  logs `lead.consent_given {lead_id, via:'email'}` and confirms in the lead's
+  language. The stored text names the request that was answered (`clave vN`
+  of the `envios` row it came from) so the trail points at the exact copy.
+  The event is logged after the write and can never undo it. Idempotent: a lead already consenting is no write and no event.
+  A lead who had opted out and then follows the link is honoured (the click
+  is theirs and it is more recent), and the event carries `after_opt_out`.
 
 ## Language convention
 
@@ -91,9 +109,23 @@ two Content sids: the Spanish one in `content_sid` / `content_estado` /
 switches language silently: an English lead whose English Content is not
 approved gets a 422 `template_not_approved`, not the Spanish template.
 
-The chassis's own copy (the `/baja` page, the footer, the refusal and error
-sentences) lives in `src/locales/es.json` and `en.json` with identical key
-sets; nothing user-facing is hardcoded in JS.
+The chassis's own copy (the `/baja` and `/si` pages, the footer, the refusal
+and error sentences) lives in `src/locales/es.json` and `en.json` with
+identical key sets; nothing user-facing is hardcoded in JS.
+
+## Consent gate
+
+`leads` has three consent states, not two, and marketing reads all three:
+`consentimiento` true sends; false **with** a `consentimiento_en` date is an
+opt-out (only `/baja` and a WhatsApp BAJA write that pair) and refuses with
+`consent_revoked`; false with no date is a lead nobody ever asked and refuses
+with `no_consent` — except for the consent request itself, the one message
+whose purpose is to ask. That exemption needs two conditions on the row:
+`evento = campana.consentimiento` **and** a clave under
+`consentimiento.solicitud`. Either alone is a field any signed-in CRM user can
+edit, so either alone would be a way to reach the never-asked leads with an
+ordinary marketing template. It never reaches a lead who said no. `src/consent.js` holds it;
+the email and WhatsApp paths share the one function.
 
 ## Status taxonomy
 
@@ -107,7 +139,7 @@ skipped. Twilio maps `queued|sending → registrado`, `sent → enviado`,
 `hard_bounce`…) and `error_texto` a plain sentence (ours for the known
 codes, the provider's with phones masked otherwise).
 
-Refusal codes on a 4xx: `no_phone`, `no_consent`, `outside_window`,
+Refusal codes on a 4xx: `no_phone`, `no_consent`, `consent_revoked`, `outside_window`,
 `template_not_approved` (422); `template_unknown`, `lead_unknown` (404);
 `template_channel`, `variables_missing`, `text_too_long`, `template_required`,
 `lead_required`, `actividad_invalid` (400). `provider_unavailable` (timeout

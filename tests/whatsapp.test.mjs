@@ -116,6 +116,25 @@ test('marketing without consent → 422 no_consent; utility without consent is s
   assert.equal(r2.status, 200);
 });
 
+test('the consent request goes to a lead nobody asked; a lead who said no gets consent_revoked', async () => {
+  // The WhatsApp twin of the CU-15 template: marketing, and exempt through its
+  // own evento — the same gate the email path uses, from the same module.
+  const solicitud = { ...marketing, id: 'pl3', clave: 'consentimiento.solicitud', evento: 'campana.consentimiento', variables: ['nombre'] };
+  const neverAsked = { ...lead, consentimiento: false };
+  const saidNo = { ...lead, consentimiento: false, consentimiento_en: hoursAgo(72) };
+  const a = setup({ leads: [neverAsked], plantillas: [plantilla, marketing, solicitud] });
+  const r1 = await sendWhatsapp({ lead_id: 'lead1', plantilla: 'consentimiento.solicitud' }, a.ctx);
+  assert.equal(r1.status, 200);
+  const b = setup({ leads: [saidNo], plantillas: [plantilla, marketing, solicitud] });
+  const r2 = await sendWhatsapp({ lead_id: 'lead1', plantilla: 'consentimiento.solicitud' }, b.ctx);
+  assert.equal(r2.status, 422);
+  assert.equal(r2.body.error.code, 'consent_revoked');
+  assert.equal(b.pb.writes.length, 0, 'nothing is written to a lead who opted out');
+  const c = setup({ leads: [saidNo], plantillas: [plantilla, marketing, solicitud] });
+  const r3 = await sendWhatsapp({ lead_id: 'lead1', plantilla: 'propiedad.encaja' }, c.ctx);
+  assert.equal(r3.body.error.code, 'consent_revoked');
+});
+
 test('no phone or an ambiguous phone → 422 no_phone', async () => {
   for (const telefono of ['', '12345', '+0034600', 'llámame']) {
     const { pb, ctx } = setup({ leads: [{ ...lead, telefono }] });

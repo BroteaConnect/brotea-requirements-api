@@ -9,6 +9,8 @@
 import { createTransport } from 'nodemailer';
 import { randomBytes } from 'node:crypto';
 import { locale, t } from './copy.js';
+import { consentGate, linkVariables, redactLinks, redactedValues, withoutLinks } from './consent.js';
+import { bodyPlaceholders, loadTemplate, missingVariables, render, variableNames } from './templates.js';
 import { RANK, moves } from './twilio.js';
 
 const SMTP_HOST = process.env.SMTP_HOST;
@@ -84,6 +86,69 @@ const textoAHtml = (text) =>
   text.split(/\n{2,}/).map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`).join('') +
   `</body></html>`;
 
+// -- a `plantillas` row for one lead -----------------------------------------
+// Everything POST /send-email needs to resolve {lead_id, plantilla,
+// variables} into a message, with no environment of its own: the server hands
+// in `pb` and the public origin, so the whole decision runs in a test.
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const REFUSAL_STATUS = {
+  lead_required: 400, lead_unknown: 404, template_unknown: 404, template_channel: 400,
+  template_retired: 422, no_email: 400, no_consent: 422, consent_revoked: 422, variables_missing: 400,
+};
+const refuse = (code, vars) => ({ code, status: REFUSAL_STATUS[code] ?? 400, vars });
+
+/**
+ * Resolve a template send for a lead: {to, subject, text, idioma, plantilla,
+ * values} when it may go out, {code, status, vars} when it may not.
+ */
+export async function resolveTemplateEmail({ leadId, clave, given }, { pb: pbCall, publicUrl, secret }) {
+  if (!leadId) return refuse('lead_required');
+  let lead;
+  try {
+    lead = await pbCall('GET', `/api/collections/leads/records/${encodeURIComponent(leadId)}`);
+  } catch (e) {
+    if (e.status === 404) return refuse('lead_unknown');
+    throw e;
+  }
+  const loaded = await loadTemplate(pbCall, clave, 'email');
+  if (loaded.code) return refuse(loaded.code, { canal: 'email' });
+  const plantilla = loaded.plantilla;
+  const to = String(lead.email ?? '').trim();
+  if (!EMAIL_RE.test(to)) return refuse('no_email');
+  const gate = consentGate(plantilla, lead);
+  if (gate) return refuse(gate);
+
+  const idioma = locale(lead.idioma);
+  const names = variableNames(plantilla);
+  const asunto = plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '';
+  const cuerpo = plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '';
+  // What the links are filled from is what the text actually uses, not only
+  // what the row declares: `render` substitutes every placeholder it finds, so
+  // a row that says {{baja_url}} without listing it would otherwise go out
+  // with the placeholder visible in it.
+  const used = [...new Set([...names, ...bodyPlaceholders(asunto), ...bodyPlaceholders(cuerpo)])];
+  const values = {
+    // Security-relevant, both halves: the caller's own value for a link name
+    // is dropped, and the signed links — minted with a secret only the chassis
+    // holds — go in last. A caller can neither be asked for them nor
+    // substitute its own.
+    nombre: lead.nombre || '',
+    ...withoutLinks(given && typeof given === 'object' ? given : {}),
+    ...linkVariables(used, { publicUrl, leadId, secret }),
+  };
+  // A link we cannot mint (no public origin, no secret) stays missing: the
+  // refusal names it, rather than a body reaching an inbox with a literal
+  // {{baja_url}} in it.
+  const missing = missingVariables(names, values);
+  if (missing.length) return refuse('variables_missing', { names: missing.join(', ') });
+
+  return {
+    to, plantilla, idioma, values,
+    subject: render(asunto, values).trim(),
+    text: render(cuerpo, values).trim(),
+  };
+}
+
 /**
  * Send one email, record it as a lead activity and as an `envios` row.
  * With `leadId` and `bajaUrl` the opt-out footer is appended in the lead's
@@ -105,12 +170,19 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
     headers: { 'X-Mailin-custom': `lead:${leadId ?? ''}` },
   });
 
+  // The rows keep the message, never the credential in it: `actividades` and
+  // `envios` are readable by every signed-in CRM user, and a /si link stored
+  // there would let any of them grant a lead's consent. The email that left
+  // carries the real URLs; what is kept says `[si_url]`.
+  const stored = redactLinks(text, variables);
+  const storedVariables = variables ? redactedValues(variables) : variables;
+
   let activityId = null;
   let envioId = null;
   if (leadId && pbReady) {
     const act = await pbCall('POST', '/api/collections/actividades/records', {
       lead: leadId, tipo: 'email', direccion: 'saliente',
-      asunto: subject, nota: text.slice(0, 2000),
+      asunto: subject, nota: stored.slice(0, 2000),
       estado_envio: 'enviado', mensaje_id: messageId,
     });
     activityId = act.id;
@@ -127,7 +199,7 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
         ...(plantilla ? { plantilla, plantilla_version: Number(plantillaVersion) || 1 } : {}),
         ...(activityId ? { actividad: activityId } : {}),
         canal: 'email', mensaje_id: messageId, estado: 'enviado', enviado_en: now.toISOString(),
-        ...(variables ? { variables } : {}),
+        ...(storedVariables ? { variables: storedVariables } : {}),
       });
       envioId = envio.id;
     } catch (e) {
