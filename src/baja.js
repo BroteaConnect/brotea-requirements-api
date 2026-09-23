@@ -24,13 +24,24 @@ const STYLE = `:root{${vars}}` +
   'main{max-width:var(--container);margin:0 auto;background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius);padding:var(--space-6)}' +
   'h1{font-size:1.25rem;margin:0 0 var(--space-4);color:var(--color-primary)}' +
   'p{margin:0 0 var(--space-2)}' +
-  'p[lang=en]{color:var(--color-muted)}';
+  'p[lang=en]{color:var(--color-muted)}' +
+  'form{margin-top:var(--space-4)}' +
+  'button{font:inherit;background:var(--color-primary);color:var(--color-surface);border:0;border-radius:var(--radius);padding:var(--space-2) var(--space-6);cursor:pointer}';
 
-/** The HTML page for a result: 'done' (revoked or already revoked) or 'invalid'. */
-export function bajaPage(result) {
-  const key = result === 'invalid' ? 'baja_invalid' : 'baja_done';
+/**
+ * The HTML page for a step: 'ask' (the link was opened: one button, so a
+ * mail scanner following the link never opts anyone out), 'done' (revoked
+ * or already revoked) or 'invalid'. `form` carries the lead and the token
+ * the button posts back.
+ */
+export function bajaPage(result, form = {}) {
+  const key = result === 'invalid' ? 'baja_invalid' : result === 'ask' ? 'baja_ask' : 'baja_done';
+  const button = result === 'ask'
+    ? `<form method="post" action="/baja"><input type="hidden" name="lead" value="${escapeHtml(form.lead ?? '')}"><input type="hidden" name="t" value="${escapeHtml(form.t ?? '')}">` +
+      `<button type="submit">${escapeHtml(t('es', 'baja_confirm'))} · ${escapeHtml(t('en', 'baja_confirm'))}</button></form>`
+    : '';
   return '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     `<meta name="robots" content="noindex"><title>${escapeHtml(t('es', 'baja_title'))}</title><style>${STYLE}</style></head>` +
     `<body><main><h1>${escapeHtml(t('es', 'baja_title'))} · ${escapeHtml(t('en', 'baja_title'))}</h1>` +
-    `<p lang="es">${escapeHtml(t('es', key))}</p><p lang="en">${escapeHtml(t('en', key))}</p></main></body></html>`;
+    `<p lang="es">${escapeHtml(t('es', key))}</p><p lang="en">${escapeHtml(t('en', key))}</p>${button}</main></body></html>`;
 }

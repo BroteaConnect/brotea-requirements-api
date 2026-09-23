@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  RANK, STATUS_MAP, buildApprovalRequest, buildCreateContent, buildListContentAndApprovals, buildSendMessage,
+  RANK, STATUS_MAP, buildApprovalRequest, buildCreateContent, buildFetchContent, buildListContentAndApprovals, buildSendMessage,
   callTwilio, moves, parseStatusCallback, signature, twilioAuth, twilioCaller, twilioError, validSignature, whatsappAddress,
 } from '../src/twilio.js';
 
@@ -59,6 +59,11 @@ test('buildCreateContent and buildApprovalRequest follow the Content API shapes'
   assert.deepEqual(a.body, { name: 'visita_confirmacion_es_v1', category: 'UTILITY' });
   assert.equal(buildApprovalRequest({ sid: 'HX1', name: 'x', category: 'marketing' }).body.category, 'MARKETING');
   assert.throws(() => buildApprovalRequest({ sid: 'HX1', name: 'x', category: 'authentication' }), /category/);
+
+  const f = buildFetchContent({ sid: 'HX' + 'a'.repeat(32) });
+  assert.equal(f.method, 'GET');
+  assert.equal(f.url, `https://content.twilio.com/v1/Content/HX${'a'.repeat(32)}`);
+  assert.throws(() => buildFetchContent({ sid: '../Content' }), /Content sid/);
 
   const l = buildListContentAndApprovals();
   assert.equal(l.method, 'GET');

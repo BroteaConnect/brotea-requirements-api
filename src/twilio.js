@@ -112,6 +112,12 @@ export function buildApprovalRequest({ sid, name, category }) {
   };
 }
 
+/** One Content resource by sid (its friendly_name carries the version it was submitted under). */
+export function buildFetchContent({ sid }) {
+  if (!/^HX[0-9a-f]{32}$/i.test(String(sid))) throw new Error('buildFetchContent: sid must be a Content sid');
+  return { method: 'GET', url: `${CONTENT_ORIGIN}/Content/${sid}`, headers: {}, body: null };
+}
+
 /** One page of every Content resource with its approval state. */
 export function buildListContentAndApprovals({ pageSize = 100, pageToken } = {}) {
   const q = new URLSearchParams({ PageSize: String(pageSize) });

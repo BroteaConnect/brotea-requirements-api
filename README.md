@@ -69,9 +69,16 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   `content_motivo` from Meta's `rejection_reason`) and answers
   `{ok, updated:[{clave, content_estado, content_estado_en, …}], checked}`.
 - `GET /baja?lead=&t=` — the opt-out link from the email footer (`t` =
-  HMAC-SHA256 of the lead id). Sets `leads.consentimiento = false` with the
-  date and the text, logs `lead.consent_revoked {lead_id, via:'email'}`, and
-  shows one page in both languages. A bad token is a 403 page.
+  HMAC-SHA256 of the lead id). GET only shows a one-button page (mail
+  scanners follow every link; a scanner must never opt a lead out);
+  `POST /baja` with the same `lead` and `t` does the write: sets
+  `leads.consentimiento = false` with the date and the text, logs
+  `lead.consent_revoked {lead_id, via:'email'}`, and shows the confirmation
+  in both languages. A bad token is a 403 page on either verb.
+  A resubmission after Meta judged a template (`rejected`, `paused`,
+  `disabled`) is refused with class `version_unchanged` (409) until the
+  row's `version` moves past the one in the existing Content's name; a
+  Content whose approval request failed is reused, not recreated.
 
 ## Language convention
 
@@ -103,7 +110,10 @@ codes, the provider's with phones masked otherwise).
 Refusal codes on a 4xx: `no_phone`, `no_consent`, `outside_window`,
 `template_not_approved` (422); `template_unknown`, `lead_unknown` (404);
 `template_channel`, `variables_missing`, `text_too_long`, `template_required`,
-`lead_required` (400). `provider_unavailable` is a 502 (timeout or 5xx).
+`lead_required`, `actividad_invalid` (400). `provider_unavailable` (timeout
+or 5xx) and `ledger_unavailable` (PocketBase failed before the send; nothing
+left) are 502. Once Twilio has returned a SID the answer is 200 whatever the
+ledger or the events table say (`recorded: false` when the rows lag).
 
 ## Events
 
@@ -113,8 +123,10 @@ Actor `chassis`: `whatsapp.sent {lead_id, envio_id, plantilla, via, mensaje_id}`
 `content.synced`, `content.sync_failed`, `lead.consent_revoked {lead_id,
 via:'email'}`. Actor `twilio`: `whatsapp.status_received {mensaje_id, status,
 result}` on every callback. Actor `brevo`: `email.event_received`. The historic
-routes keep actor `requirements-api`. Payloads carry ids, never a phone, an
-email or a message body.
+routes keep actor `requirements-api`. Payloads by the `chassis` and `twilio`
+actors carry ids, never a phone, an email or a message body (the historic
+`email.sent` / `email.event_received` rows still name the address, as they
+did before).
 
 ## Env
 

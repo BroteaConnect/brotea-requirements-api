@@ -191,12 +191,13 @@ async function handleGlitchtipAlert(req, res, url) {
 // via /brevo-webhook and lands on the same activity record.
 const OUTBOUND_SECRET = process.env.OUTBOUND_SECRET;
 
-async function readJson(req, res) {
+async function readJson(req, res, { optional = false } = {}) {
   let raw = '';
   for await (const chunk of req) {
     raw += chunk;
     if (raw.length > MAX_BODY) { send(res, 413, { error: 'body too large' }); return null; }
   }
+  if (optional && raw.trim() === '') return {};
   try {
     return JSON.parse(raw);
   } catch {
@@ -324,7 +325,8 @@ async function handleTwilioStatus(req, res) {
 async function handleContent(req, res, url, action) {
   if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
   if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
-  const data = await readJson(req, res);
+  // The body is optional on both: /content/sync without one syncs every row.
+  const data = await readJson(req, res, { optional: true });
   if (!data) return undefined;
   if (!contentConfigured() || !pbConfigured()) return send(res, 503, { error: 'not configured' });
   const clave = data.clave ? String(data.clave).trim() : '';
@@ -335,15 +337,27 @@ async function handleContent(req, res, url, action) {
   return send(res, out.status, out.body);
 }
 
-// The opt-out link from an email footer. A page, not JSON: a person clicks it.
+// The opt-out link from an email footer. A page, not JSON: a person clicks
+// it. GET only shows the button — mail scanners follow every link in an
+// email, and a scanner must never opt a lead out — and POST does the write.
+// Both carry the same signed token.
 async function handleBaja(req, res, url) {
-  const leadId = url.searchParams.get('lead') ?? '';
-  const token = url.searchParams.get('t') ?? '';
-  const page = (status, result) => {
+  const page = (status, result, form) => {
     res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(bajaPage(result));
+    res.end(bajaPage(result, form));
   };
+  let leadId; let token;
+  if (req.method === 'GET') {
+    leadId = url.searchParams.get('lead') ?? '';
+    token = url.searchParams.get('t') ?? '';
+  } else {
+    const form = await readForm(req, res);
+    if (!form) return undefined;
+    leadId = form.lead ?? '';
+    token = form.t ?? '';
+  }
   if (!bajaSecret() || !validBajaToken(leadId, token, bajaSecret())) return page(403, 'invalid');
+  if (req.method === 'GET') return page(200, 'ask', { lead: leadId, t: token });
   if (!pbConfigured()) return page(503, 'invalid');
   try {
     await revokeByEmail(leadId, { pb, logEvent: logChassis });
@@ -519,7 +533,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/twilio-status') return await handleTwilioStatus(req, res);
     if (req.method === 'POST' && url.pathname === '/content/submit') return await handleContent(req, res, url, 'submit');
     if (req.method === 'POST' && url.pathname === '/content/sync') return await handleContent(req, res, url, 'sync');
-    if (req.method === 'GET' && url.pathname === '/baja') return await handleBaja(req, res, url);
+    if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/baja') return await handleBaja(req, res, url);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);

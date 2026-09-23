@@ -108,6 +108,50 @@ test('a pending row → already_submitted; a half-submitted row only submits the
   assert.equal(r2.body.content_estado, 'approved');
 });
 
+const fetched = (sid, friendly_name) => ({ status: 200, data: { sid, friendly_name } });
+
+test('a retry after a failed approval reuses the Content instead of creating another', async () => {
+  const pb = fakePb({ plantillas: [{ ...row, content_sid: HX_ES, content_estado: 'unsubmitted', content_motivo: 'earlier failure' }] });
+  const twilio = fakeTwilio([fetched(HX_ES, 'visita_confirmacion_es_v3'), approved(), created(HX_EN), approved()]);
+  const out = await submitContent({ clave: 'visita.confirmacion' }, { pb, twilio, logEvent: fakeEvents() });
+  assert.equal(out.status, 200);
+  assert.deepEqual(twilio.calls.map((c) => `${c.method} ${c.url}`), [
+    `GET https://content.twilio.com/v1/Content/${HX_ES}`,
+    `POST https://content.twilio.com/v1/Content/${HX_ES}/ApprovalRequests/whatsapp`,
+    'POST https://content.twilio.com/v1/Content',
+    `POST https://content.twilio.com/v1/Content/${HX_EN}/ApprovalRequests/whatsapp`,
+  ]);
+  assert.equal(twilio.calls[1].body.name, 'visita_confirmacion_es_v3');
+  assert.equal(pb.row('plantillas', 'pl1').content_sid, HX_ES, 'the sid did not change');
+  assert.equal(pb.row('plantillas', 'pl1').content_estado, 'received');
+  assert.equal(pb.row('plantillas', 'pl1').content_motivo, '');
+});
+
+test('a rejected row is refused with version_unchanged until the version moves past the name, then submitted anew', async () => {
+  const rejected = { ...row, content_sid: HX_ES, content_estado: 'rejected', content_motivo: 'INVALID_FORMAT', content_sid_en: HX_EN, content_estado_en: 'approved' };
+  const same = fakePb({ plantillas: [rejected] });
+  const t1 = fakeTwilio([fetched(HX_ES, 'visita_confirmacion_es_v3')]);
+  const logEvent = fakeEvents();
+  const r1 = await submitContent({ clave: 'visita.confirmacion' }, { pb: same, twilio: t1, logEvent });
+  assert.equal(r1.status, 409);
+  assert.equal(r1.body.error.class, 'version_unchanged');
+  assert.match(r1.body.error.text, /visita_confirmacion_es_v3/);
+  assert.equal(t1.calls.length, 1, 'only the fetch; nothing created');
+  assert.equal(same.writes.length, 0);
+  assert.equal(logEvent.events[0].payload.class, 'version_unchanged');
+  const bumped = fakePb({ plantillas: [{ ...rejected, version: 4 }] });
+  const t2 = fakeTwilio([fetched(HX_ES, 'visita_confirmacion_es_v3'), created('HX' + 'd'.repeat(32)), approved()]);
+  const r2 = await submitContent({ clave: 'visita.confirmacion' }, { pb: bumped, twilio: t2, logEvent: fakeEvents() });
+  assert.equal(r2.status, 200);
+  assert.equal(t2.calls[1].body.friendly_name, 'visita_confirmacion_es_v4');
+  assert.equal(bumped.row('plantillas', 'pl1').content_sid, 'HX' + 'd'.repeat(32));
+  // A Content Twilio no longer has (404) is simply recreated.
+  const gone = fakePb({ plantillas: [{ ...row, content_sid: HX_ES, content_estado: 'unsubmitted' }] });
+  const t3 = fakeTwilio([{ status: 404, data: {} }, created(HX_ES), approved(), created(HX_EN), approved()]);
+  assert.equal((await submitContent({ clave: 'visita.confirmacion' }, { pb: gone, twilio: t3, logEvent: fakeEvents() })).status, 200);
+  assert.equal(t3.calls[1].method, 'POST');
+});
+
 test('an unknown clave or an email row is refused before Twilio', async () => {
   const pb = fakePb({ plantillas: [{ ...row, canal: 'email' }] });
   const twilio = fakeTwilio();
@@ -149,6 +193,7 @@ test('sync with a clave reads one row; nothing changed → empty updated; a prov
   const twilio = fakeTwilio([listing([{ sid: HX_ES, approval_requests: { status: 'approved' } }, { sid: 'HX' + 'c'.repeat(32), approval_requests: { status: 'approved' } }])]);
   const out = await syncContent({ clave: 'visita.confirmacion' }, { pb, twilio, logEvent: fakeEvents() });
   assert.deepEqual(out.body, { ok: true, updated: [], checked: 1 });
+  assert.match(pb.reads.at(-1).query, /clave = "visita\.confirmacion"/);
   assert.equal(pb.writes.length, 0);
   const logEvent = fakeEvents();
   const down = await syncContent({}, { pb, twilio: fakeTwilio([{ error: new Error('timeout') }]), logEvent });

@@ -20,8 +20,13 @@ const LEDGER_LOCALE = 'es';
 const REFUSAL_STATUS = {
   lead_required: 400, lead_unknown: 404, template_unknown: 404, template_channel: 400,
   template_retired: 422, template_required: 400, variables_missing: 400, text_too_long: 400,
-  no_phone: 422, no_consent: 422, outside_window: 422, template_not_approved: 422,
+  no_phone: 422, no_consent: 422, outside_window: 422, template_not_approved: 422, actividad_invalid: 400,
 };
+const PB_ID = /^[a-z0-9]{15}$/i;
+
+/** An events write that can never turn a message that left into a 500. */
+const safeLog = (logEvent, type, payload) =>
+  Promise.resolve().then(() => logEvent(type, payload)).catch((e) => console.error(`event ${type} not logged:`, e.message));
 
 class Refusal extends Error {
   constructor(code, vars) {
@@ -76,6 +81,19 @@ export async function sendWhatsapp(input, { pb, twilio, logEvent, now = new Date
   }
   if (!plantilla && text.length > BODY_MAX) return refuse('text_too_long');
 
+  // A caller-owned activity must exist and belong to this lead before anything is written.
+  if (actividadId) {
+    if (!PB_ID.test(actividadId)) return refuse('actividad_invalid');
+    let act;
+    try {
+      act = await pb('GET', `${records('actividades')}/${encodeURIComponent(actividadId)}`);
+    } catch (e) {
+      if (e.status === 404) return refuse('actividad_invalid');
+      throw e;
+    }
+    if (act.lead !== leadId) return refuse('actividad_invalid');
+  }
+
   const to = leadPhoneE164(lead.telefono);
   if (!to) return refuse('no_phone');
   if (plantilla?.categoria === 'marketing' && !lead.consentimiento) return refuse('no_consent');
@@ -108,22 +126,32 @@ export async function sendWhatsapp(input, { pb, twilio, logEvent, now = new Date
   const rendered = plantilla ? render(picked.cuerpo, values) : text;
 
   // -- the rows before the send ---------------------------------------------
+  // A ledger that fails here is a 502 with the activity in error and a
+  // send_failed event, never a 500 with a row left in registrado.
   let activity = actividadId;
-  if (!activity) {
-    const act = await pb('POST', records('actividades'), {
-      lead: leadId, tipo: 'whatsapp', direccion: 'saliente',
-      asunto: plantilla?.nombre || picked?.asunto || t(idioma, 'whatsapp_subject'),
-      nota: rendered.slice(0, 2000), estado_envio: 'registrado',
+  let envio;
+  try {
+    if (!activity) {
+      const act = await pb('POST', records('actividades'), {
+        lead: leadId, tipo: 'whatsapp', direccion: 'saliente',
+        asunto: plantilla?.nombre || picked?.asunto || t(idioma, 'whatsapp_subject'),
+        nota: rendered.slice(0, 2000), estado_envio: 'registrado',
+        ...(campanaId ? { campana: campanaId } : {}),
+      });
+      activity = act.id;
+    }
+    envio = await pb('POST', records('envios'), {
+      lead: leadId,
+      ...(plantilla ? { plantilla: plantilla.id, plantilla_version: Number(plantilla.version) || 1 } : {}),
       ...(campanaId ? { campana: campanaId } : {}),
+      actividad: activity, canal: 'whatsapp', estado: 'registrado', variables: values,
     });
-    activity = act.id;
+  } catch (e) {
+    console.error('ledger write failed before the send:', e.message);
+    if (activity) await pb('PATCH', `${records('actividades')}/${encodeURIComponent(activity)}`, { estado_envio: 'error' }).catch(() => {});
+    await safeLog(logEvent, 'whatsapp.send_failed', { lead_id: leadId, envio_id: null, plantilla: clave || null, code: 'ledger_unavailable' });
+    return { status: 502, body: { ok: false, actividad_id: activity, estado: 'error', error: { code: 'ledger_unavailable', text: t(LEDGER_LOCALE, 'refusal.ledger_unavailable') } } };
   }
-  const envio = await pb('POST', records('envios'), {
-    lead: leadId,
-    ...(plantilla ? { plantilla: plantilla.id, plantilla_version: Number(plantilla.version) || 1 } : {}),
-    ...(campanaId ? { campana: campanaId } : {}),
-    actividad: activity, canal: 'whatsapp', estado: 'registrado', variables: values,
-  });
 
   // -- the send ------------------------------------------------------------------
   const req = buildSendMessage({ accountSid, from, to, ...message, statusCallback: `${publicUrl.replace(/\/$/, '')}/twilio-status` });
@@ -137,26 +165,31 @@ export async function sendWhatsapp(input, { pb, twilio, logEvent, now = new Date
     const unavailable = res.status === 0 || res.status >= 500;
     const err = unavailable ? { code: 'provider_unavailable', text: t(LEDGER_LOCALE, 'refusal.provider_unavailable') } : twilioError(res.status, res.data);
     const errorTexto = unavailable ? err.text : errorText(err.code, err.text);
-    await pb('PATCH', `${records('envios')}/${envio.id}`, {
-      estado: 'error', error_en: now.toISOString(), error_codigo: err.code, error_texto: errorTexto,
-    });
-    await pb('PATCH', `${records('actividades')}/${activity}`, { estado_envio: 'error' });
-    await logEvent('whatsapp.send_failed', { lead_id: leadId, envio_id: envio.id, plantilla: clave || null, code: err.code });
+    try {
+      await pb('PATCH', `${records('envios')}/${envio.id}`, {
+        estado: 'error', error_en: now.toISOString(), error_codigo: err.code, error_texto: errorTexto,
+      });
+      await pb('PATCH', `${records('actividades')}/${encodeURIComponent(activity)}`, { estado_envio: 'error' });
+    } catch (e) {
+      console.error('ledger write failed after the refusal:', e.message);
+    }
+    await safeLog(logEvent, 'whatsapp.send_failed', { lead_id: leadId, envio_id: envio.id, plantilla: clave || null, code: err.code });
     return { status: 502, body: { ok: false, envio_id: envio.id, actividad_id: activity, estado: 'error', via, error: { code: err.code, text: errorTexto } } };
   }
 
   // -- the ledger after the SID: a failure here is reported, never hides the send --
+  // From here on the answer is 200 whatever the ledger or the events table say.
   const sid = res.data?.sid ?? null;
   let recorded = true;
   try {
     await pb('PATCH', `${records('envios')}/${envio.id}`, { mensaje_id: sid, estado: 'enviado', enviado_en: now.toISOString() });
-    await pb('PATCH', `${records('actividades')}/${activity}`, { estado_envio: 'enviado', mensaje_id: sid });
+    await pb('PATCH', `${records('actividades')}/${encodeURIComponent(activity)}`, { estado_envio: 'enviado', mensaje_id: sid });
     await pb('PATCH', `${records('leads')}/${encodeURIComponent(leadId)}`, { ultimo_contacto: now.toISOString() });
   } catch (e) {
     recorded = false;
-    await logEvent('whatsapp.sent_unrecorded', { lead_id: leadId, envio_id: envio.id, mensaje_id: sid, error: String(e.message).slice(0, 200) });
+    await safeLog(logEvent, 'whatsapp.sent_unrecorded', { lead_id: leadId, envio_id: envio.id, mensaje_id: sid, error: String(e.message).slice(0, 200) });
   }
-  await logEvent('whatsapp.sent', { lead_id: leadId, envio_id: envio.id, plantilla: clave || null, via, mensaje_id: sid });
+  await safeLog(logEvent, 'whatsapp.sent', { lead_id: leadId, envio_id: envio.id, plantilla: clave || null, via, mensaje_id: sid });
   return { status: 200, body: { ok: true, envio_id: envio.id, actividad_id: activity, mensaje_id: sid, estado: 'enviado', via, ...(recorded ? {} : { recorded: false }) } };
 }
 

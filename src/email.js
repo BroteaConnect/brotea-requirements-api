@@ -173,7 +173,7 @@ export async function applyBrevoEvent(payload, deps = {}) {
   const found = await pbCall('GET', `/api/collections/actividades/records?perPage=1&filter=${filter}`);
   const act = found.items?.[0];
   if (!act) result = { skipped: true, reason: 'activity not found' };
-  else if ((RANK[estado] ?? 0) <= (RANK[act.estado_envio] ?? 0)) result = { skipped: true, reason: 'already further along', estado: act.estado_envio };
+  else if (!moves(act.estado_envio, estado)) result = { skipped: true, reason: act.estado_envio === 'simulado' ? 'simulated' : 'already further along', estado: act.estado_envio };
   else {
     await pbCall('PATCH', `/api/collections/actividades/records/${act.id}`, { estado_envio: estado });
     result = { updated: act.id, estado };

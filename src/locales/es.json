@@ -1,6 +1,11 @@
 {
   "baja_title": "Baja de comunicaciones",
   "baja_done": "Hecho: no volveremos a escribirte.",
+  "baja_ask": "¿Quieres dejar de recibir nuestros mensajes? Pulsa el botón para confirmarlo.",
+  "baja_confirm": "Darme de baja",
+  "refusal.actividad_invalid": "La actividad indicada no existe o no es de este lead.",
+  "refusal.ledger_unavailable": "No se ha podido registrar el envío; no se ha enviado nada.",
+  "refusal.version_unchanged": "Meta ya juzgó esta plantilla con ese nombre: sube la versión antes de volver a enviarla.",
   "baja_invalid": "Este enlace no es válido. Si quieres dejar de recibir mensajes, responde BAJA al último correo.",
   "baja_email_text": "Baja desde el enlace del correo",
   "email_footer_baja": "Si no quieres recibir más mensajes: {url}",

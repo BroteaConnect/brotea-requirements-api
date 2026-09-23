@@ -6,13 +6,16 @@
 // field the schema does not have yet is ignored by PocketBase, so the
 // Spanish path never depends on the English fields existing.
 import { dict, t } from './copy.js';
-import { loadTemplate, positional, toContentBody, variableNames } from './templates.js';
-import { buildApprovalRequest, buildCreateContent, buildListContentAndApprovals } from './twilio.js';
+import { loadTemplate, pbQuote, positional, toContentBody, variableNames } from './templates.js';
+import { buildApprovalRequest, buildCreateContent, buildFetchContent, buildListContentAndApprovals } from './twilio.js';
 
 const LANGS = ['es', 'en'];
 const SUBMITTED = new Set(['received', 'pending', 'approved']);
+/** Meta keeps the name of a template it has judged: a new submission needs a new version in the name. */
+const JUDGED = new Set(['rejected', 'paused', 'disabled']);
 const FIELDS = { es: { sid: 'content_sid', estado: 'content_estado', motivo: 'content_motivo' }, en: { sid: 'content_sid_en', estado: 'content_estado_en', motivo: 'content_motivo_en' } };
-const CLASS_STATUS = { provider_auth: 502, sender_not_ready: 502, template_invalid: 502, provider_unavailable: 502, already_submitted: 409, template_unknown: 404, template_channel: 400 };
+const CLASS_STATUS = { provider_auth: 502, sender_not_ready: 502, template_invalid: 502, provider_unavailable: 502, already_submitted: 409, version_unchanged: 409, template_unknown: 404, template_channel: 400 };
+const HX = /^HX[0-9a-f]{32}$/i;
 const records = (c) => `/api/collections/${c}/records`;
 
 /** Meta's template name: `<clave with dots → underscores>_<lang>_v<version>`, lowercase alphanumerics and underscores only. */
@@ -51,6 +54,31 @@ async function call(twilio, req) {
   try { return await twilio(req); } catch (e) { return { status: 0, ok: false, data: { message: e.message } }; }
 }
 
+/** The version encoded in a Content's friendly_name (`…_v3` → 3), or null. */
+const versionInName = (name) => { const m = /_v(\d+)$/.exec(String(name ?? '')); return m ? Number(m[1]) : null; };
+
+/**
+ * The Content to reuse for a language, or null when a new one must be
+ * created. A sid whose approval never went (estado unsubmitted) is reused
+ * as it is; a sid Meta has judged is only left behind once the row's
+ * version moved past the one in its name, else the retry is refused.
+ */
+async function reusable(twilio, row, lang) {
+  const sid = row[FIELDS[lang].sid];
+  const estado = row[FIELDS[lang].estado] || 'unsubmitted';
+  if (!HX.test(String(sid ?? ''))) return null;
+  const existing = await call(twilio, buildFetchContent({ sid }));
+  if (existing.status === 404) return null;
+  if (!existing.ok) throw classify(existing, 'fetch');
+  const name = existing.data?.friendly_name ?? '';
+  if (estado === 'unsubmitted') return { sid, name: /^[a-z0-9_]+$/.test(name) ? name : contentName(row.clave, lang, row.version) };
+  if (JUDGED.has(estado)) {
+    const was = versionInName(name);
+    if (was != null && (Number(row.version) || 1) <= was) throw new ContentFailure('version_unchanged', 0, null, `${name}`);
+  }
+  return null;
+}
+
 /**
  * Create the row's Content in every language that is not submitted yet and
  * request WhatsApp approval for each. Resolves {status, body}.
@@ -70,12 +98,19 @@ export async function submitContent({ clave }, { pb, twilio, logEvent }) {
   const patch = {};
   let failure = null;
   for (const lang of todo) {
-    const name = contentName(clave, lang, row.version);
-    const body = toContentBody(row[`cuerpo_${lang}`] || row.cuerpo_es || '', names);
-    const created = await call(twilio, buildCreateContent({ friendlyName: name, language: lang, body, variables: sampleVariables(names, lang) }));
-    if (!created.ok) { failure = classify(created, 'create'); break; }
-    const sid = created.data.sid;
-    patch[FIELDS[lang].sid] = sid;
+    let reuse;
+    try { reuse = await reusable(twilio, row, lang); } catch (f) { failure = f; break; }
+    let sid; let name;
+    if (reuse) {
+      ({ sid, name } = reuse);
+    } else {
+      name = contentName(clave, lang, row.version);
+      const body = toContentBody(row[`cuerpo_${lang}`] || row.cuerpo_es || '', names);
+      const created = await call(twilio, buildCreateContent({ friendlyName: name, language: lang, body, variables: sampleVariables(names, lang) }));
+      if (!created.ok) { failure = classify(created, 'create'); break; }
+      sid = created.data.sid;
+      patch[FIELDS[lang].sid] = sid;
+    }
     const approval = await call(twilio, buildApprovalRequest({ sid, name, category: row.categoria }));
     if (!approval.ok) {
       // The Content exists; keep its sid on the row so a retry finds it, and say why the approval did not go.
@@ -125,7 +160,7 @@ async function readApprovals(twilio) {
  * from Twilio and PATCH only the rows whose state or reason changed.
  */
 export async function syncContent({ clave } = {}, { pb, twilio, logEvent }) {
-  const filter = clave ? `canal = "whatsapp" && clave = "${String(clave).replace(/"/g, '')}"` : 'canal = "whatsapp"';
+  const filter = clave ? `canal = "whatsapp" && clave = ${pbQuote(clave)}` : 'canal = "whatsapp"';
   const found = await pb('GET', `${records('plantillas')}?perPage=200&filter=${encodeURIComponent(filter)}`);
   const rows = (found?.items ?? []).filter((r) => r.content_sid || r.content_sid_en);
   let live;

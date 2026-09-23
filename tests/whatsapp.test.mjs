@@ -149,15 +149,16 @@ test('the template problems and the input problems have their own codes', async 
 });
 
 test('with actividad_id the activity is only patched and its nota is untouched', async () => {
-  const mine = { id: 'actX', lead: 'lead1', tipo: 'whatsapp', direccion: 'saliente', nota: 'written by the bot', estado_envio: 'registrado' };
+  const ACT = 'actbot000000001';
+  const mine = { id: ACT, lead: 'lead1', tipo: 'whatsapp', direccion: 'saliente', nota: 'written by the bot', estado_envio: 'registrado' };
   const { pb, ctx } = setup({ actividades: [inbound, mine] });
-  const out = await sendWhatsapp({ lead_id: 'lead1', plantilla: 'visita.confirmacion', variables: vars, actividad_id: 'actX' }, ctx);
+  const out = await sendWhatsapp({ lead_id: 'lead1', plantilla: 'visita.confirmacion', variables: vars, actividad_id: ACT }, ctx);
   assert.equal(out.status, 200);
-  assert.equal(out.body.actividad_id, 'actX');
+  assert.equal(out.body.actividad_id, ACT);
   assert.equal(pb.writesTo('actividades', 'POST').length, 0);
-  assert.equal(pb.row('actividades', 'actX').nota, 'written by the bot');
-  assert.equal(pb.row('actividades', 'actX').estado_envio, 'enviado');
-  assert.equal(pb.writes[0].body.actividad, 'actX');
+  assert.equal(pb.row('actividades', ACT).nota, 'written by the bot');
+  assert.equal(pb.row('actividades', ACT).estado_envio, 'enviado');
+  assert.equal(pb.writes[0].body.actividad, ACT);
 });
 
 test('Twilio 400 63016 → envios error with the code verbatim, 502, whatsapp.send_failed', async () => {
@@ -198,6 +199,53 @@ test('a ledger failure after the SID → 200 with recorded:false and whatsapp.se
   assert.match(out.body.mensaje_id, /^SM/);
   assert.deepEqual(logEvent.events.map((e) => e.type), ['whatsapp.sent_unrecorded', 'whatsapp.sent']);
   assert.equal(logEvent.events[0].payload.mensaje_id, out.body.mensaje_id);
+});
+
+test('once a SID exists the answer is 200 even when the events table is down', async () => {
+  const { pb, ctx } = setup();
+  let calls = 0;
+  ctx.logEvent = async () => { calls++; throw new Error('postgres down'); };
+  const out = await sendWhatsapp({ lead_id: 'lead1', text: 'hola' }, ctx);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.ok, true);
+  assert.equal(calls, 1, 'whatsapp.sent was attempted');
+  assert.equal(pb.row('envios', out.body.envio_id).estado, 'enviado');
+  // The provider error path is a 502 with its rows, not a 500, when the events table is down.
+  const { ctx: c2, pb: pb2 } = setup({ script: [{ status: 400, data: { code: 63024, message: 'bad' } }] });
+  c2.logEvent = async () => { throw new Error('postgres down'); };
+  const failed = await sendWhatsapp({ lead_id: 'lead1', text: 'hola' }, c2);
+  assert.equal(failed.status, 502);
+  assert.equal(pb2.row('envios', failed.body.envio_id).error_codigo, '63024');
+});
+
+test('a caller-owned activity must be a PocketBase id, exist, and belong to the lead', async () => {
+  const other = { id: 'actOtherLead000', lead: 'lead2', tipo: 'whatsapp', direccion: 'saliente', estado_envio: 'registrado' };
+  for (const actividad_id of ['../records', 'nope', 'actOtherLead000', 'act000000000000']) {
+    const { pb, ctx, logEvent } = setup({ actividades: [inbound, other] });
+    const out = await sendWhatsapp({ lead_id: 'lead1', text: 'hola', actividad_id }, ctx);
+    assert.equal(out.status, 400, actividad_id);
+    assert.equal(out.body.error.code, 'actividad_invalid');
+    assert.equal(pb.writes.length, 0);
+    assert.equal(logEvent.of('whatsapp.refused')[0].payload.code, 'actividad_invalid');
+  }
+});
+
+test('a ledger failure before the send is a 502 ledger_unavailable with the activity in error and nothing sent', async () => {
+  const { pb, twilio, logEvent, ctx } = setup();
+  pb.failOnce('POST', 'envios', new Error('pb POST: 503'));
+  const out = await sendWhatsapp({ lead_id: 'lead1', text: 'hola' }, ctx);
+  assert.equal(out.status, 502);
+  assert.equal(out.body.error.code, 'ledger_unavailable');
+  assert.equal(twilio.calls.length, 0);
+  assert.equal(pb.row('actividades', out.body.actividad_id).estado_envio, 'error');
+  assert.deepEqual(logEvent.events, [{ type: 'whatsapp.send_failed', payload: { lead_id: 'lead1', envio_id: null, plantilla: null, code: 'ledger_unavailable' } }]);
+  // The activity itself failing: nothing created, same answer.
+  const b = setup();
+  b.pb.failOnce('POST', 'actividades');
+  const r2 = await sendWhatsapp({ lead_id: 'lead1', text: 'hola' }, b.ctx);
+  assert.equal(r2.status, 502);
+  assert.equal(r2.body.actividad_id, null);
+  assert.equal(b.pb.writes.length, 0);
 });
 
 test('errorText: a known code gives our sentence, an unknown one the provider message', () => {

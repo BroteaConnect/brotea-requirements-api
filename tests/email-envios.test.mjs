@@ -51,6 +51,16 @@ test('an envios row without an activity, and an activity without a row, are each
   assert.deepEqual(await applyBrevoEvent({ event: 'request', 'message-id': MID }, { pb }), { skipped: true, event: 'request' });
 });
 
+test('a simulated send is never moved by a delivery event, on either side', async () => {
+  const pb = fakePb({
+    actividades: [{ id: 'act1', estado_envio: 'simulado', mensaje_id: MID }],
+    envios: [{ id: 'env1', actividad: 'act1', canal: 'email', estado: 'simulado', mensaje_id: MID }],
+  });
+  const r = await applyBrevoEvent({ event: 'delivered', 'message-id': MID }, { pb, now: NOW });
+  assert.deepEqual(r, { skipped: true, reason: 'simulated', estado: 'simulado', envio: { skipped: true, reason: 'simulated', estado: 'simulado' } });
+  assert.equal(pb.writes.length, 0);
+});
+
 test('sendTrackedEmail appends the opt-out footer, writes the activity and the envios row', async () => {
   const pb = fakePb({ leads: [{ id: 'lead1', idioma: 'en' }] });
   const mails = [];

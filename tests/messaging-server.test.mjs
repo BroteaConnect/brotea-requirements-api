@@ -111,7 +111,7 @@ test('POST /twilio-status signed over PUBLIC_URL + /twilio-status → 200 {skipp
   assert.equal(ev.payload.result.skipped, true);
 });
 
-test('GET /baja with a bad token → 403 and both languages\' baja_invalid; a good token reaches PocketBase', async () => {
+test('GET /baja with a bad token → 403 and both languages\' baja_invalid; a good token shows the button and writes nothing', async () => {
   const bad = await fetch(`${BASE}/baja?lead=lead1&t=nope`);
   assert.equal(bad.status, 403);
   assert.match(bad.headers.get('content-type'), /text\/html/);
@@ -119,8 +119,24 @@ test('GET /baja with a bad token → 403 and both languages\' baja_invalid; a go
   assert.ok(html.includes(t('es', 'baja_invalid')));
   assert.ok(html.includes(t('en', 'baja_invalid')));
   assert.match(html, /--color-bg:/);
-  const good = await fetch(`${BASE}/baja?lead=lead1&t=${bajaToken('lead1', 'test-outbound')}`);
+  assert.doesNotMatch(html, /<form/);
+  const token = bajaToken('lead1', 'test-outbound');
+  const good = await fetch(`${BASE}/baja?lead=lead1&t=${token}`);
+  assert.equal(good.status, 200, 'a GET never touches PocketBase (which is down here)');
+  const page = await good.text();
+  assert.ok(page.includes(t('es', 'baja_ask')) && page.includes(t('en', 'baja_ask')));
+  assert.ok(page.includes(t('es', 'baja_confirm')));
+  assert.match(page, /<form method="post" action="\/baja">/);
+  assert.match(page, new RegExp(`name="t" value="${token}"`));
+  assert.match(page, /name="lead" value="lead1"/);
+});
+
+test('POST /baja does the write: 403 on a bad token, and the good token reaches PocketBase', async () => {
+  const bad = await fetch(`${BASE}/baja`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: 'nope' }) });
+  assert.equal(bad.status, 403);
+  const good = await fetch(`${BASE}/baja`, { method: 'POST', headers: form, body: new URLSearchParams({ lead: 'lead1', t: bajaToken('lead1', 'test-outbound') }) });
   assert.equal(good.status, 502, 'the token passed; PocketBase is what failed');
+  assert.ok((await good.text()).includes(t('es', 'baja_invalid')));
 });
 
 test('POST /send-email with a plantilla and no lead_id → 400 lead_required', async () => {
@@ -137,4 +153,9 @@ test('POST /content/submit needs a clave; /content/sync accepts an empty body', 
   assert.equal((await r.json()).error.code, 'clave_required');
   const s = await fetch(`${BASE}/content/sync?secret=test-outbound`, { method: 'POST', headers: json, body: '{}' });
   assert.equal(s.status, 500, 'routed, PocketBase unreachable');
+  const empty = await fetch(`${BASE}/content/sync?secret=test-outbound`, { method: 'POST' });
+  assert.equal(empty.status, 500, 'an empty body is {} — the same path, not a 400');
+  const emptySubmit = await fetch(`${BASE}/content/submit?secret=test-outbound`, { method: 'POST' });
+  assert.equal(emptySubmit.status, 400);
+  assert.equal((await emptySubmit.json()).error.code, 'clave_required');
 });

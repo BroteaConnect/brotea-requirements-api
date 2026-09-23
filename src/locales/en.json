@@ -1,6 +1,11 @@
 {
   "baja_title": "Unsubscribe",
   "baja_done": "Done: we will not write to you again.",
+  "baja_ask": "Do you want to stop receiving our messages? Press the button to confirm.",
+  "baja_confirm": "Unsubscribe me",
+  "refusal.actividad_invalid": "The activity named does not exist or is not this lead's.",
+  "refusal.ledger_unavailable": "The send could not be recorded; nothing was sent.",
+  "refusal.version_unchanged": "Meta has already judged this template under that name: bump the version before resubmitting.",
   "baja_invalid": "This link is not valid. To stop receiving messages, reply STOP to the last email.",
   "baja_email_text": "Unsubscribed from the email link",
   "email_footer_baja": "If you do not want more messages: {url}",
