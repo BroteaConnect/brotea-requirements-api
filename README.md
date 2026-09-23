@@ -20,11 +20,77 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
 - `GET /roadmap?project=`, `GET /garden`, `GET /assets/*` — public reads.
 - `POST /glitchtip-webhook?project=&secret=` — error alerts to Telegram.
 
-### Messaging (all gated by `?secret=OUTBOUND_SECRET`; 403 without it)
+### Who may call the messaging routes
 
-- `POST /send-email` — two shapes. Legacy `{to, subject, text, lead_id?,
-  from_name?}`; or `{lead_id, plantilla, variables?, from_name?}`, which
-  resolves the address from the lead, the subject and body from the
+Two credentials, and they are not interchangeable.
+
+| caller | credential |
+| --- | --- |
+| a browser (the CRM) | `Authorization: Bearer <PocketBase user token>` |
+| a host process (`brotea-whatsapp`, `jobs/*.mjs`, the E5 gates) | `?secret=<OUTBOUND_SECRET>` |
+
+A static app has no private storage: anything its bundle holds is published the
+moment the bundle is served. `crm-inmobiliaria.brotea.dev` served the shared
+secret inside its JS to anyone who asked, so the secret stopped being a
+credential. The browser's credential is its own user's PocketBase token —
+validated on every request against this chassis's `PB_URL` with
+`POST /api/collections/<PB_AUTH_COLLECTION>/auth-refresh`, never cached, and
+required to belong to a user whose `role` is one of `superadmin`, `admin`,
+`member` (a users collection with no `role` field at all is accepted: that
+project's model does not express staff). This is the contract in the platform's
+`docs/social-factory-buildout.md` §4.4.
+
+The secret is refused outright when the request could only have come from a
+browser — `Origin`, `Referer`, `Sec-Fetch-Site`, `Sec-Fetch-Dest` or a
+`Mozilla/` user agent. (`Sec-Fetch-Mode` is deliberately not on that list:
+Node's own `fetch` sends `sec-fetch-mode: cors`, so counting it would lock out
+every host caller.) This stops browsers, not attackers — a published secret is
+only really retired by rotating it.
+
+Refusals, each with its own `error.code` so a log can tell them apart:
+`forbidden` (403, no credential), `invalid_token` (401, expired, malformed or
+minted by another project's PocketBase), `not_staff` (403), `secret_from_browser`
+(403), `auth_unavailable` (503, PocketBase did not answer — never an open door),
+`auth_not_configured` (503). Every outcome leaves an events row: `chassis.refused
+{route, code, status}` and, for an accepted token, `chassis.authorized {route,
+via, user_id, role}`. Neither ever carries a token or the secret.
+
+#### What the CRM must send
+
+`src/crm/api.ts` today builds `?secret=${PUBLIC_OUTBOUND_SECRET}`. It becomes a
+header and nothing else changes — same host, same paths, same bodies, same
+`{ok:false, error:{code,text}}` failure shape:
+
+```ts
+const res = await fetch(`${CHASSIS_URL}${path}`, {   // no ?secret=
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${pbToken()}`,            // src/lib/pb.ts authStore token
+  },
+  body: JSON.stringify(body),
+});
+```
+
+`enviarEmail` loses one field: `{lead_id, subject, text, from_name}` — drop
+`to`, which is now ignored. `enviarPlantilla` and `sincronizarContent` keep
+their bodies exactly. `PUBLIC_OUTBOUND_SECRET` then has no reader and must be
+deleted from the build args, or the next bundle publishes it again.
+
+A 401 `invalid_token` means the agent's session expired: sign in again and
+retry, rather than surfacing it as a send failure.
+
+`POST /twilio-status` and `POST /brevo-webhook` are **not** in this table.
+A provider callback authenticates as the provider — Twilio's signature, Brevo's
+query secret — and asking Twilio for a person's token is how a delivery state
+stops being recorded.
+
+### Messaging
+
+- `POST /send-email` — two shapes, both naming a lead and **neither naming an
+  address**: `{lead_id, subject, text, from_name?}` for free text the agent
+  wrote, or `{lead_id, plantilla, variables?, from_name?}`, which
+  resolves the subject and body from the
   `plantillas` row (`asunto_<idioma>` / `cuerpo_<idioma>`, `{{nombre}}` filled
   from the lead) and applies the [consent gate](#consent-gate) (422
   `no_consent` / `consent_revoked`). The signed links a subject or body uses —
@@ -52,6 +118,16 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   language. Writes the `actividades` row and an `envios` row
   (`canal: email`, `mensaje_id` = our Message-ID, `estado: enviado`). Answers
   `{ok, message_id, activity_id, envio_id}`.
+
+  **The recipient is never read from the request.** A `to` in the body is
+  ignored; the address comes from the `leads` row named by `lead_id`, which is
+  required (400 `lead_required` without it, 404 `lead_unknown` for a lead that
+  is not there, 400 `no_email` for one with no usable address). The old
+  arbitrary-`to` shape made this endpoint a mail relay over the agency's own
+  SMTP identity, SPF and DKIM for whoever held the credential, and the
+  credential was in a public bundle. Nothing on the host used that shape, so it
+  is gone for every caller rather than kept for the trusted ones — the trust
+  was the part that failed.
 - `POST /brevo-webhook?secret=` — Brevo's delivery events. Updates the
   activity and the `envios` row by Message-ID under the never-backwards rule,
   stamps `entregado_en` / `abierto_en` / `click_en` / `error_en`, keeps the
@@ -214,9 +290,12 @@ did before).
 ## Env
 
 `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PORT`,
-`GLITCHTIP_WEBHOOK_SECRET`, `OUTBOUND_SECRET` (via Coolify — never committed).
+`GLITCHTIP_WEBHOOK_SECRET`, `OUTBOUND_SECRET` (via Coolify — never committed;
+it is a server-to-server credential and must never be built into an app bundle).
 The CRM's PocketBase: `PB_URL`, `PB_ADMIN_EMAIL`, `PB_ADMIN_PASS`, `PB_PROJECT`
-(default `inmobiliaria`). Email: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+(default `inmobiliaria`). Browser auth: `PB_AUTH_COLLECTION` (default `users`,
+the auth collection the app signs in against) and `PB_STAFF_ROLES` (default
+`superadmin,admin,member`). Email: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
 `SMTP_PASS`, `MAIL_FROM`. WhatsApp and Content: `PUBLIC_URL` (the exact
 public origin, e.g. `https://api.brotea.dev` — it goes into every
 `StatusCallback` and is what the callback signature is computed over),
@@ -232,7 +311,9 @@ and the opt-in links (falls back to `OUTBOUND_SECRET`).
 the signature check copied verbatim from the platform's
 `whatsapp/src/transports/twilio.js`, the status map and rank, and the thin
 caller; its header records the provider references and the date they were
-read. `src/whatsapp.js` and `src/content.js` are the flows, `src/email.js` the
+read. `src/auth.js` is the credential decision — token parsing, the browser test,
+the staff test and one `authorize` — all pure but the one `fetch` that asks
+PocketBase whether a token is live. `src/whatsapp.js` and `src/content.js` are the flows, `src/email.js` the
 email relay and template resolution (`resolveTemplateEmail`),
 `src/consent.js` the consent gate, the signed `/baja` and `/si` links and
 their writes, `src/baja.js` the two pages, `src/templates.js` the placeholder

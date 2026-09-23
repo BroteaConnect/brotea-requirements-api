@@ -117,28 +117,27 @@ test('POST /send-email without secret is forbidden', async () => {
   assert.equal(r.status, 403);
 });
 
-test('POST /send-email rejects an invalid recipient', async () => {
-  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
-    method: 'POST',
-    body: JSON.stringify({ to: 'not-an-email', subject: 'x', text: 'y' }),
-  });
-  assert.equal(r.status, 400);
-  assert.deepEqual(await r.json(), { error: 'invalid to' });
+// The endpoint no longer takes a recipient from anybody. A body that names
+// only an address is not "a send to that address" any more; it is a request
+// that names no lead, and that is a refusal before anything else is looked at.
+test('POST /send-email will not take a recipient from the request', async () => {
+  for (const body of [
+    { to: 'not-an-email', subject: 'x', text: 'y' },
+    { to: 'alguien@example.com', subject: 'hola', text: 'texto' },
+  ]) {
+    const r = await fetch(`${BASE}/send-email?secret=test-outbound`, { method: 'POST', body: JSON.stringify(body) });
+    assert.equal(r.status, 400, JSON.stringify(body));
+    const json = await r.json();
+    assert.equal(json.error.code, 'lead_required', JSON.stringify(body));
+  }
 });
 
-test('POST /send-email requires subject and text', async () => {
+test('POST /send-email with a lead but no PocketBase reports it, and never 500', async () => {
+  // This harness configures neither PB_* nor SMTP_*: the address can only come
+  // from a `leads` row, so with no PocketBase there is nowhere to read it.
   const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
     method: 'POST',
-    body: JSON.stringify({ to: 'alguien@example.com', subject: '', text: '' }),
-  });
-  assert.equal(r.status, 400);
-});
-
-test('POST /send-email without SMTP config reports it', async () => {
-  // El entorno de test no trae SMTP_*: debe fallar limpio, no 500.
-  const r = await fetch(`${BASE}/send-email?secret=test-outbound`, {
-    method: 'POST',
-    body: JSON.stringify({ to: 'alguien@example.com', subject: 'hola', text: 'texto' }),
+    body: JSON.stringify({ lead_id: 'abcdefghijklmno', subject: 'hola', text: 'texto' }),
   });
   assert.equal(r.status, 503);
 });
