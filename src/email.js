@@ -29,6 +29,9 @@ const getTransport = () => (transport ??= createTransport({
 }));
 
 // -- PocketBase superuser session (cached, re-authenticated on expiry) --------
+// Every call is bounded: some of these run on the public form's request path,
+// and a stalled PocketBase must become a logged failure, not a held socket.
+const PB_TIMEOUT_MS = 5_000;
 let pbToken = null;
 let pbTokenAt = 0;
 async function pbAuth() {
@@ -37,6 +40,7 @@ async function pbAuth() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ identity: PB_ADMIN_EMAIL, password: PB_ADMIN_PASS }),
+    signal: AbortSignal.timeout(PB_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`pb auth ${res.status}`);
   const { token } = await res.json();
@@ -45,14 +49,26 @@ async function pbAuth() {
   return token;
 }
 
-async function pb(method, path, body) {
+/** One PocketBase call as the superuser. A 401/403 means the cached token is
+ *  no longer good (restart, rotated password): drop it and retry once, so a
+ *  bad token never poisons the next ten minutes. */
+export async function pb(method, path, body, { retry = true } = {}) {
   const token = await pbAuth();
   const res = await fetch(`${PB_URL}${path}`, {
     method,
     headers: { 'Content-Type': 'application/json', Authorization: token },
     ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(PB_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`pb ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+  if ((res.status === 401 || res.status === 403) && retry) {
+    pbToken = null;
+    return pb(method, path, body, { retry: false });
+  }
+  if (!res.ok) {
+    const err = new Error(`pb ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.status === 204 ? null : res.json();
 }
 
