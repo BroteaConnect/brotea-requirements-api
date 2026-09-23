@@ -45,7 +45,7 @@ async function pbAuth() {
   return token;
 }
 
-async function pb(method, path, body) {
+export async function pb(method, path, body) {
   const token = await pbAuth();
   const res = await fetch(`${PB_URL}${path}`, {
     method,

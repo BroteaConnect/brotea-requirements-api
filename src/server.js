@@ -3,6 +3,7 @@ import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
 import { sendTrackedEmail, applyBrevoEvent, emailConfigured } from './email.js';
+import { assignWebLead } from './assign.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const PORT = Number(process.env.PORT ?? 3000);
@@ -48,6 +49,11 @@ async function sendToProjectTopic(projectId, text) {
   });
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?${params}`);
 }
+
+const logEvent = (type, payload) => pool.query(
+  'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
+  ['requirements-api', type, payload],
+);
 
 function notifyTopic(projectId, projectName, content, submittedBy) {
   const excerpt = content.length > 300 ? `${content.slice(0, 300)}…` : content;
@@ -98,6 +104,13 @@ async function handleSubmission(req, res) {
   );
   notifyTopic(rows[0].id, rows[0].name, content, submittedBy ?? 'anónimo')
     .catch((e) => console.error('notify failed:', e.message));
+
+  // A web lead gets an owner right away (see assign.js). It never fails the
+  // form: the requirement is already stored and the outcome is an events row.
+  if (source === 'lead_web') {
+    await assignWebLead({ leadId: data.lead_id, project, logEvent })
+      .catch((e) => console.error('lead assign crashed:', e.message));
+  }
 
   return send(res, 201, { ok: true, id: ins.rows[0].id });
 }

@@ -2,10 +2,15 @@
 
 Tiny ingestion endpoint for Brotea landing-page requirement forms.
 
-- `POST /requirements` — `{project, source, submitted_by, content}` →
+- `POST /requirements` — `{project, source, submitted_by, content, lead_id?}` →
   validates, inserts into the `requirements` table, logs a
   `requirement.received` event and notifies the project's Telegram topic.
   CORS open (public forms), 5 req/min per IP.
+  With `source: 'lead_web'` and a `lead_id` (the PocketBase `leads` record the
+  form just created) it also assigns the lead: to the on-duty agent named in the
+  `settings` row `agentes.guardia`, else to the oldest user; an owner already
+  set is kept. Logged as `lead.assigned` / `lead.assign_failed`; a failed
+  assignment never fails the form (still 201).
 - `GET /health` — liveness.
 
 Env: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PORT`
