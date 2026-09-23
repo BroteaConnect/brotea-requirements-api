@@ -94,8 +94,35 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const REFUSAL_STATUS = {
   lead_required: 400, lead_unknown: 404, template_unknown: 404, template_channel: 400,
   template_retired: 422, no_email: 400, no_consent: 422, consent_revoked: 422, variables_missing: 400,
+  campana_invalid: 400,
 };
 const refuse = (code, vars) => ({ code, status: REFUSAL_STATUS[code] ?? 400, vars });
+
+// A PocketBase record id: what /send-whatsapp requires of an `actividad_id`.
+const PB_ID = /^[a-z0-9]{15}$/i;
+
+/**
+ * The campaign a send belongs to: {campanaId} (null when the caller named
+ * none) or {code, status} when what it named is not a campaign.
+ *
+ * /send-whatsapp only checks the shape, because it writes its rows BEFORE the
+ * send and PocketBase's relation check refuses a stray id there with nothing
+ * sent. An email's rows are written AFTER the SMTP send, so the same stray id
+ * would fail once the mail had already left; the campaign is read first
+ * instead. No PocketBase call is made when the caller names none.
+ */
+export async function resolveCampaign(value, { pb: pbCall }) {
+  const campanaId = (value == null ? '' : String(value)).trim() || null;
+  if (!campanaId) return { campanaId };
+  if (!PB_ID.test(campanaId)) return refuse('campana_invalid');
+  try {
+    await pbCall('GET', `/api/collections/campanas/records/${encodeURIComponent(campanaId)}`);
+  } catch (e) {
+    if (e.status === 404) return refuse('campana_invalid');
+    throw e;
+  }
+  return { campanaId };
+}
 
 /**
  * The address a free-text email goes to: the `leads` row's, never the
@@ -175,9 +202,10 @@ export async function resolveTemplateEmail({ leadId, clave, given }, { pb: pbCal
 /**
  * Send one email, record it as a lead activity and as an `envios` row.
  * With `leadId` and `bajaUrl` the opt-out footer is appended in the lead's
- * language. Returns { message_id, activity_id, envio_id, smtp }.
+ * language. With `campanaId` both rows carry the campaign, as a WhatsApp send
+ * does. Returns { message_id, activity_id, envio_id, smtp }.
  */
-export async function sendTrackedEmail({ to, subject, text, leadId, fromName, html, plantilla, plantillaVersion, variables, bajaUrl, idioma }, deps = {}) {
+export async function sendTrackedEmail({ to, subject, text, leadId, fromName, html, plantilla, plantillaVersion, variables, bajaUrl, idioma, campanaId }, deps = {}) {
   const pbCall = deps.pb ?? pb;
   const pbReady = deps.pb ? true : pbConfigured();
   const now = deps.now ?? new Date();
@@ -207,6 +235,7 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
       lead: leadId, tipo: 'email', direccion: 'saliente',
       asunto: subject, nota: stored.slice(0, 2000),
       estado_envio: 'enviado', mensaje_id: messageId,
+      ...(campanaId ? { campana: campanaId } : {}),
     });
     activityId = act.id;
     await pbCall('PATCH', `/api/collections/leads/records/${leadId}`, {
@@ -221,6 +250,7 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
         ...(leadId ? { lead: leadId } : {}),
         ...(plantilla ? { plantilla, plantilla_version: Number(plantillaVersion) || 1 } : {}),
         ...(activityId ? { actividad: activityId } : {}),
+        ...(campanaId ? { campana: campanaId } : {}),
         canal: 'email', mensaje_id: messageId, estado: 'enviado', enviado_en: now.toISOString(),
         ...(storedVariables ? { variables: storedVariables } : {}),
       });
