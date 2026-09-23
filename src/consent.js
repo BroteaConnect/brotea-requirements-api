@@ -9,6 +9,7 @@
 // the text and the date, one lead.consent_given event.
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { locale, t } from './copy.js';
+import { pbQuote } from './templates.js';
 
 // The `plantillas.evento` of the two consent-request templates,
 // `consentimiento.solicitud` (WhatsApp) and `consentimiento.solicitud.email`.
@@ -17,9 +18,19 @@ import { locale, t } from './copy.js';
 // exemption and a new marketing template cannot inherit it by accident.
 export const CONSENT_REQUEST_EVENT = 'campana.consentimiento';
 
+// Two conditions, not one, and the second is the reason the first is not
+// enough: `plantillas.update` on the deployed instance is open to any
+// signed-in CRM user, so `evento` is a field an operator can type. Setting it
+// on a marketing template would otherwise open the 216 never-asked leads to
+// that template. The clave is equally editable, but the pair means the
+// exemption cannot be reached by changing one field of one row by accident,
+// and a row that claims both is a deliberate act with an audit trail.
+export const CONSENT_REQUEST_CLAVE_PREFIX = 'consentimiento.solicitud';
+
 /** The message asking for consent — the one message that cannot require it. */
 export const isConsentRequest = (plantilla) =>
-  String(plantilla?.evento ?? '') === CONSENT_REQUEST_EVENT;
+  String(plantilla?.evento ?? '') === CONSENT_REQUEST_EVENT
+  && String(plantilla?.clave ?? '').startsWith(CONSENT_REQUEST_CLAVE_PREFIX);
 
 /**
  * Whether this template may go to this lead: null to send, or the refusal
@@ -76,10 +87,23 @@ export const bajaUrl = (publicUrl, leadId, secret) => link('baja', publicUrl, le
 export const siUrl = (publicUrl, leadId, secret) => link('si', publicUrl, leadId, secret);
 
 /**
- * The link placeholders a template declares, as values. Only the names in
- * `names` come back, so a template that does not mention `{{si_url}}` never
- * carries one — and the caller never has to supply either (it could not: the
- * secret is the chassis's) nor gets a variables_missing for them.
+ * The placeholder names the chassis fills in itself. A caller's value for one
+ * of these is dropped before anything is rendered: `render` substitutes any
+ * placeholder it finds in the values, declared in the row's `variables` or
+ * not, so trusting the declaration would let a row that uses `{{baja_url}}`
+ * without declaring it carry somebody else's opt-out link.
+ */
+export const LINK_NAMES = ['baja_url', 'si_url'];
+
+/** A caller's variables with the chassis's own names taken out. */
+export const withoutLinks = (given) =>
+  Object.fromEntries(Object.entries(given ?? {}).filter(([name]) => !LINK_NAMES.includes(name)));
+
+/**
+ * The link placeholders a template asks for, as values. Only the names in
+ * `names` come back, so a template that mentions neither link never carries
+ * one — and the caller never has to supply either (it could not: the secret
+ * is the chassis's) nor gets a variables_missing for them.
  */
 export function linkVariables(names, { publicUrl, leadId, secret }) {
   if (!publicUrl || !leadId || !secret) return {};
@@ -90,16 +114,71 @@ export function linkVariables(names, { publicUrl, leadId, secret }) {
   return Object.fromEntries((names ?? []).filter((name) => name in all).map((name) => [name, all[name]]));
 }
 
+/**
+ * The same text with every link value replaced by `[name]`. A signed link is
+ * a bearer credential — following /si flips a lead's consent and the row it
+ * writes is indistinguishable from a real one — and `actividades` and
+ * `envios` are readable by every signed-in CRM user. The email carries the
+ * real URL; what we keep says only that a link was sent.
+ */
+export function redactLinks(text, values = {}) {
+  let out = String(text ?? '');
+  for (const name of LINK_NAMES) {
+    const url = values[name];
+    if (typeof url === 'string' && url) out = out.split(url).join(`[${name}]`);
+  }
+  return out;
+}
+
+/** The same values with every link replaced by `[name]`, for a stored row. */
+export const redactedValues = (values = {}) =>
+  Object.fromEntries(Object.entries(values).map(([name, v]) => [name, LINK_NAMES.includes(name) && v ? `[${name}]` : v]));
+
 // -- what following a link writes -------------------------------------------
 // The same cap the WhatsApp path uses for consentimiento_texto: the evidence
 // is a sentence on the lead, not a document.
 const CONSENT_TEXT_MAX = 300;
 
-/** The evidence stored on the lead: the exact copy the /si page showed them. */
-export const consentText = (idioma) => {
+/** An events write that can never undo a consent write that already committed. */
+const safeLog = (logEvent, type, payload) =>
+  Promise.resolve().then(() => logEvent(type, payload)).catch((e) => console.error(`event ${type} not logged:`, e.message));
+
+/**
+ * The evidence stored on the lead: the exact copy the /si page showed them,
+ * and the identity of the request they answered. Not the request's body
+ * inline — it is up to 2000 characters, carries the lead's own data and a
+ * signed link, and this field is a sentence of 300; the clave and version
+ * name the exact copy, which `plantillas` keeps under that version, and the
+ * `envios` row of the send is the other half of the trail.
+ */
+export const consentText = (idioma, reference) => {
   const loc = locale(idioma);
-  return `${t(loc, 'si_ask')} ${t(loc, 'si_confirm')}`.slice(0, CONSENT_TEXT_MAX);
+  const shown = `${t(loc, 'si_ask')} ${t(loc, 'si_confirm')}`;
+  return (reference ? `${shown} [${reference}]` : shown).slice(0, CONSENT_TEXT_MAX);
 };
+
+/**
+ * `clave vN` of the consent request this lead was actually sent, or '' when
+ * there is none to point at. Best effort by design: a read that fails must
+ * never cost somebody the consent they just gave, so the write goes ahead
+ * with the page copy alone.
+ */
+async function requestReference(pb, leadId) {
+  try {
+    const filter = encodeURIComponent(`evento = ${pbQuote(CONSENT_REQUEST_EVENT)} && canal = "email"`);
+    const found = await pb('GET', `/api/collections/plantillas/records?perPage=1&filter=${filter}`);
+    const plantilla = found?.items?.[0];
+    if (!plantilla || !isConsentRequest(plantilla)) return '';
+    const sent = await pb('GET', `/api/collections/envios/records?perPage=1&sort=-created&filter=${
+      encodeURIComponent(`lead = ${pbQuote(leadId)} && plantilla = ${pbQuote(plantilla.id)}`)}`);
+    const envio = sent?.items?.[0];
+    if (!envio) return '';
+    return `${plantilla.clave} v${Number(envio.plantilla_version) || Number(plantilla.version) || 1}`;
+  } catch (e) {
+    console.error('consent request reference not read:', e.message);
+    return '';
+  }
+}
 
 /**
  * Revoke a lead's consent from the email link. Idempotent: a lead already
@@ -114,7 +193,10 @@ export async function revokeByEmail(leadId, { pb, logEvent, now = new Date() }) 
     consentimiento_en: now.toISOString(),
     consentimiento_texto: t(idioma, 'baja_email_text'),
   });
-  await logEvent('lead.consent_revoked', { lead_id: leadId, via: 'email' });
+  // After the PATCH, never before: the write has committed, and a platform
+  // database that is down must not turn a recorded opt-out into "this link is
+  // not valid" for the person who clicked it.
+  await safeLog(logEvent, 'lead.consent_revoked', { lead_id: leadId, via: 'email' });
   return { revoked: true, idioma };
 }
 
@@ -135,8 +217,8 @@ export async function grantByEmail(leadId, { pb, logEvent, now = new Date() }) {
   await pb('PATCH', `/api/collections/leads/records/${encodeURIComponent(leadId)}`, {
     consentimiento: true,
     consentimiento_en: now.toISOString(),
-    consentimiento_texto: consentText(idioma),
+    consentimiento_texto: consentText(idioma, await requestReference(pb, leadId)),
   });
-  await logEvent('lead.consent_given', { lead_id: leadId, via: 'email', ...(afterOptOut ? { after_opt_out: true } : {}) });
+  await safeLog(logEvent, 'lead.consent_given', { lead_id: leadId, via: 'email', ...(afterOptOut ? { after_opt_out: true } : {}) });
   return { granted: true, idioma, ...(afterOptOut ? { afterOptOut: true } : {}) };
 }

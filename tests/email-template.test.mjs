@@ -4,9 +4,9 @@
 // change to a body that breaks a placeholder shows up here.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveTemplateEmail } from '../src/email.js';
+import { resolveTemplateEmail, sendTrackedEmail } from '../src/email.js';
 import { bajaUrl, siUrl } from '../src/consent.js';
-import { fakePb } from './helpers/fake-pb.mjs';
+import { NOW, fakePb } from './helpers/fake-pb.mjs';
 
 const PUBLIC_URL = 'https://api.brotea.dev';
 const SECRET = 's3cret';
@@ -93,14 +93,48 @@ test('si_url and baja_url reach the body without the caller supplying either', a
 });
 
 test('a caller cannot substitute its own opt-in or opt-out link', async () => {
-  const pb = setup();
   const r = await resolveTemplateEmail(
     { leadId: 'lead1', clave: 'consentimiento.solicitud.email', given: { ...vars, si_url: 'https://evil.example/si', baja_url: 'https://evil.example/baja' } },
-    ctx(pb),
+    ctx(setup()),
   );
   assert.equal(r.values.si_url, siUrl(PUBLIC_URL, 'lead1', SECRET));
   assert.equal(r.values.baja_url, bajaUrl(PUBLIC_URL, 'lead1', SECRET));
   assert.ok(!r.text.includes('evil.example'));
+  // The row that proves it: it USES both links and DECLARES neither, so
+  // nothing but dropping the caller's value keeps them out of the body —
+  // `render` substitutes any placeholder it finds in the values.
+  const undeclared = {
+    ...solicitud, id: 'pl9', clave: 'consentimiento.solicitud.email', variables: ['nombre'],
+    cuerpo_es: 'Hola {{nombre}}, confirma: {{si_url}}\n\nBaja: {{baja_url}}',
+  };
+  const loose = await resolveTemplateEmail(
+    { leadId: 'lead1', clave: 'consentimiento.solicitud.email', given: { si_url: 'https://evil.example/si', baja_url: 'https://evil.example/baja' } },
+    ctx(fakePb({ leads: [historico], plantillas: [undeclared] })),
+  );
+  assert.equal(loose.code, undefined);
+  assert.ok(!loose.text.includes('evil.example'), 'a row that forgets to declare a link is not a way in');
+  assert.ok(loose.text.includes(siUrl(PUBLIC_URL, 'lead1', SECRET)));
+  assert.doesNotMatch(loose.text, /\{\{/, 'nor a way to a visible placeholder in an inbox');
+});
+
+test('neither the activity nor the ledger row keeps a signed link', async () => {
+  const pb = setup();
+  const r = await resolveTemplateEmail({ leadId: 'lead1', clave: 'consentimiento.solicitud.email', given: vars }, ctx(pb));
+  const sent = [];
+  await sendTrackedEmail(
+    { to: r.to, subject: r.subject, text: r.text, leadId: 'lead1', idioma: r.idioma, variables: r.values, plantilla: r.plantilla.id, plantillaVersion: r.plantilla.version },
+    { pb, now: NOW, sendMail: async (message) => { sent.push(message); return { response: '250 ok' }; } },
+  );
+  const token = /t=[A-Za-z0-9_-]{20,}/;
+  const nota = pb.writesTo('actividades', 'POST')[0].body.nota;
+  const stored = pb.writesTo('envios', 'POST')[0].body.variables;
+  assert.doesNotMatch(nota, token, 'a CRM user reading the activity gets no consent link');
+  assert.doesNotMatch(JSON.stringify(stored), token);
+  assert.ok(nota.includes('[si_url]') && nota.includes('[baja_url]'), 'the record still shows a link was sent');
+  assert.deepEqual([stored.si_url, stored.baja_url], ['[si_url]', '[baja_url]']);
+  // The email that left carries the real one.
+  assert.ok(sent[0].text.includes(siUrl(PUBLIC_URL, 'lead1', SECRET)));
+  assert.match(sent[0].html, token);
 });
 
 test('with no public origin or no secret the links are named by the refusal, never rendered as placeholders', async () => {

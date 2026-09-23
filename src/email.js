@@ -9,8 +9,8 @@
 import { createTransport } from 'nodemailer';
 import { randomBytes } from 'node:crypto';
 import { locale, t } from './copy.js';
-import { consentGate, linkVariables } from './consent.js';
-import { loadTemplate, missingVariables, render, variableNames } from './templates.js';
+import { consentGate, linkVariables, redactLinks, redactedValues, withoutLinks } from './consent.js';
+import { bodyPlaceholders, loadTemplate, missingVariables, render, variableNames } from './templates.js';
 import { RANK, moves } from './twilio.js';
 
 const SMTP_HOST = process.env.SMTP_HOST;
@@ -120,13 +120,21 @@ export async function resolveTemplateEmail({ leadId, clave, given }, { pb: pbCal
 
   const idioma = locale(lead.idioma);
   const names = variableNames(plantilla);
+  const asunto = plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '';
+  const cuerpo = plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '';
+  // What the links are filled from is what the text actually uses, not only
+  // what the row declares: `render` substitutes every placeholder it finds, so
+  // a row that says {{baja_url}} without listing it would otherwise go out
+  // with the placeholder visible in it.
+  const used = [...new Set([...names, ...bodyPlaceholders(asunto), ...bodyPlaceholders(cuerpo)])];
   const values = {
+    // Security-relevant, both halves: the caller's own value for a link name
+    // is dropped, and the signed links — minted with a secret only the chassis
+    // holds — go in last. A caller can neither be asked for them nor
+    // substitute its own.
     nombre: lead.nombre || '',
-    ...(given && typeof given === 'object' ? given : {}),
-    // Deliberately last, and security-relevant: the opt-out and opt-in links
-    // are signed with a secret only the chassis holds, so a caller can never
-    // be asked for them — and must never be able to substitute its own.
-    ...linkVariables(names, { publicUrl, leadId, secret }),
+    ...withoutLinks(given && typeof given === 'object' ? given : {}),
+    ...linkVariables(used, { publicUrl, leadId, secret }),
   };
   // A link we cannot mint (no public origin, no secret) stays missing: the
   // refusal names it, rather than a body reaching an inbox with a literal
@@ -136,8 +144,8 @@ export async function resolveTemplateEmail({ leadId, clave, given }, { pb: pbCal
 
   return {
     to, plantilla, idioma, values,
-    subject: render(plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '', values).trim(),
-    text: render(plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '', values).trim(),
+    subject: render(asunto, values).trim(),
+    text: render(cuerpo, values).trim(),
   };
 }
 
@@ -162,12 +170,19 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
     headers: { 'X-Mailin-custom': `lead:${leadId ?? ''}` },
   });
 
+  // The rows keep the message, never the credential in it: `actividades` and
+  // `envios` are readable by every signed-in CRM user, and a /si link stored
+  // there would let any of them grant a lead's consent. The email that left
+  // carries the real URLs; what is kept says `[si_url]`.
+  const stored = redactLinks(text, variables);
+  const storedVariables = variables ? redactedValues(variables) : variables;
+
   let activityId = null;
   let envioId = null;
   if (leadId && pbReady) {
     const act = await pbCall('POST', '/api/collections/actividades/records', {
       lead: leadId, tipo: 'email', direccion: 'saliente',
-      asunto: subject, nota: text.slice(0, 2000),
+      asunto: subject, nota: stored.slice(0, 2000),
       estado_envio: 'enviado', mensaje_id: messageId,
     });
     activityId = act.id;
@@ -184,7 +199,7 @@ export async function sendTrackedEmail({ to, subject, text, leadId, fromName, ht
         ...(plantilla ? { plantilla, plantilla_version: Number(plantillaVersion) || 1 } : {}),
         ...(activityId ? { actividad: activityId } : {}),
         canal: 'email', mensaje_id: messageId, estado: 'enviado', enviado_en: now.toISOString(),
-        ...(variables ? { variables } : {}),
+        ...(storedVariables ? { variables: storedVariables } : {}),
       });
       envioId = envio.id;
     } catch (e) {

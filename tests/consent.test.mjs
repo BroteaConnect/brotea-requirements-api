@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import {
-  CONSENT_REQUEST_EVENT, bajaToken, bajaUrl, consentGate, consentText, grantByEmail, isConsentRequest,
-  linkVariables, revokeByEmail, siToken, siUrl, validBajaToken, validSiToken,
+  CONSENT_REQUEST_EVENT, LINK_NAMES, bajaToken, bajaUrl, consentGate, consentText, grantByEmail, isConsentRequest,
+  linkVariables, redactLinks, redactedValues, revokeByEmail, siToken, siUrl, validBajaToken, validSiToken, withoutLinks,
 } from '../src/consent.js';
 import { bajaPage, siPage } from '../src/baja.js';
 import { t } from '../src/copy.js';
@@ -64,11 +64,16 @@ test('the consent request is exempt from the consent gate, and nothing else is',
   assert.equal(consentGate(marketing, neverAsked), 'no_consent', 'a second marketing template does not inherit it');
   assert.equal(consentGate(utility, neverAsked), null, 'utility was never gated');
   for (const p of [request, marketing, utility]) assert.equal(consentGate(p, consenting), null);
-  // The marker is the row's own evento, not its clave and not its category.
+  // The marker is the row's own evento AND its clave. Either alone is a field
+  // any signed-in CRM user can type, and one of them typed on a marketing row
+  // would otherwise open the never-asked leads to it.
   assert.ok(isConsentRequest(request));
   assert.ok(!isConsentRequest(marketing));
   assert.equal(consentGate({ ...request, evento: 'campana.otra' }, neverAsked), 'no_consent');
-  assert.equal(consentGate({ ...marketing, evento: CONSENT_REQUEST_EVENT }, neverAsked), null, 'the marker travels with the row');
+  assert.equal(consentGate({ ...marketing, evento: CONSENT_REQUEST_EVENT }, neverAsked), 'no_consent', 'an evento typed on another row does not buy the exemption');
+  assert.equal(consentGate({ ...request, clave: 'propiedad.encaja.email' }, neverAsked), 'no_consent');
+  // Both consent-request rows, WhatsApp and email, keep it.
+  assert.equal(consentGate({ ...request, clave: 'consentimiento.solicitud' }, neverAsked), null);
 });
 
 test('a lead who said no is refused with consent_revoked, the consent request included', () => {
@@ -177,4 +182,55 @@ test('the si page asks before it writes, and says done in the lead\'s language a
   assert.ok(invalid.includes(t('es', 'si_invalid')) && invalid.includes(t('en', 'si_invalid')));
   // The opt-out page is untouched: both languages, its own action.
   assert.match(bajaPage('ask', { lead: 'lead1', t: 'tok' }), /<form method="post" action="\/baja">/);
+});
+
+test('a caller value for a link name is dropped before anything is rendered', () => {
+  assert.deepEqual(LINK_NAMES, ['baja_url', 'si_url']);
+  assert.deepEqual(withoutLinks({ nombre: 'María', baja_url: 'https://evil.example/baja', si_url: 'https://evil.example/si' }), { nombre: 'María' });
+  assert.deepEqual(withoutLinks(undefined), {});
+});
+
+test('what is stored keeps the message and drops the credential in it', () => {
+  const values = { nombre: 'María', si_url: 'https://api.brotea.dev/si?lead=lead1&t=tok', baja_url: 'https://api.brotea.dev/baja?lead=lead1&t=other' };
+  const body = `Hola María, confirma: ${values.si_url}\n\nBaja: ${values.baja_url}`;
+  assert.equal(redactLinks(body, values), 'Hola María, confirma: [si_url]\n\nBaja: [baja_url]');
+  assert.deepEqual(redactedValues(values), { nombre: 'María', si_url: '[si_url]', baja_url: '[baja_url]' });
+  // Nothing to redact is not a crash and not a change.
+  assert.equal(redactLinks('Hola María', {}), 'Hola María');
+  assert.equal(redactLinks(undefined, values), '');
+  assert.deepEqual(redactedValues({ nombre: 'María' }), { nombre: 'María' });
+});
+
+test('a platform database that is down cannot undo a consent that already committed', async () => {
+  const pb = fakePb({ leads: [{ id: 'lead1', idioma: 'es', consentimiento: false }] });
+  const down = async () => { throw new Error('connect ECONNREFUSED'); };
+  const r = await grantByEmail('lead1', { pb, logEvent: down, now: NOW });
+  assert.equal(r.granted, true, 'the person is told their consent is recorded, because it is');
+  assert.equal(pb.row('leads', 'lead1').consentimiento, true);
+  // The opt-out half had the identical bug and is fixed with it.
+  const out = fakePb({ leads: [{ id: 'lead2', idioma: 'es', consentimiento: true }] });
+  const revoked = await revokeByEmail('lead2', { pb: out, logEvent: down, now: NOW });
+  assert.equal(revoked.revoked, true);
+  assert.equal(out.row('leads', 'lead2').consentimiento, false);
+});
+
+test('consentimiento_texto names the request that was answered when there is one to name', async () => {
+  const plantilla = {
+    id: 'pl1', clave: 'consentimiento.solicitud.email', canal: 'email', categoria: 'marketing',
+    evento: 'campana.consentimiento', estado: 'aprobada', version: 3,
+  };
+  const pb = fakePb({
+    leads: [{ id: 'lead1', idioma: 'es', consentimiento: false }],
+    plantillas: [plantilla],
+    envios: [{ id: 'env1', lead: 'lead1', plantilla: 'pl1', plantilla_version: 2, canal: 'email', estado: 'entregado', created: '2026-09-20 09:00:00.000Z' }],
+  });
+  await grantByEmail('lead1', { pb, logEvent: fakeEvents(), now: NOW });
+  const stored = pb.row('leads', 'lead1').consentimiento_texto;
+  assert.equal(stored, consentText('es', 'consentimiento.solicitud.email v2'), 'the version that was sent, not the row\'s current one');
+  assert.ok(stored.includes(t('es', 'si_ask')));
+  assert.ok(stored.length <= 300);
+  // Nothing to point at: the page copy alone, never a failed write.
+  const alone = fakePb({ leads: [{ id: 'lead2', idioma: 'es', consentimiento: false }] });
+  await grantByEmail('lead2', { pb: alone, logEvent: fakeEvents(), now: NOW });
+  assert.equal(alone.row('leads', 'lead2').consentimiento_texto, consentText('es'));
 });

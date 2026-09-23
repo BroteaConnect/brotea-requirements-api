@@ -27,9 +27,13 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   resolves the address from the lead, the subject and body from the
   `plantillas` row (`asunto_<idioma>` / `cuerpo_<idioma>`, `{{nombre}}` filled
   from the lead) and applies the consent gate below (422 `no_consent` /
-  `consent_revoked`). The signed links a body declares — `{{baja_url}}`,
+  `consent_revoked`). The signed links a body uses — `{{baja_url}}`,
   `{{si_url}}` — are filled in by the chassis, which alone holds the secret:
-  a caller never supplies them and can never substitute them. With a
+  a caller never supplies them, and a value it sends for one of those names
+  is dropped before anything is rendered. Neither link is ever stored: the
+  `actividades` note and the `envios` variables keep `[si_url]` in its place,
+  because a signed link is a bearer credential and those rows are readable by
+  every signed-in CRM user. With a
   `lead_id` the opt-out footer (`/baja` link) is appended in the lead's
   language. Writes the `actividades` row and an `envios` row
   (`canal: email`, `mensaje_id` = our Message-ID, `estado: enviado`). Answers
@@ -88,7 +92,9 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   reason — consent a mail scanner gave is not consent; `POST /si` sets
   `leads.consentimiento = true` with the date and the copy that was shown,
   logs `lead.consent_given {lead_id, via:'email'}` and confirms in the lead's
-  language. Idempotent: a lead already consenting is no write and no event.
+  language. The stored text names the request that was answered (`clave vN`
+  of the `envios` row it came from) so the trail points at the exact copy.
+  The event is logged after the write and can never undo it. Idempotent: a lead already consenting is no write and no event.
   A lead who had opted out and then follows the link is honoured (the click
   is theirs and it is more recent), and the event carries `after_opt_out`.
 
@@ -114,10 +120,11 @@ identical key sets; nothing user-facing is hardcoded in JS.
 opt-out (only `/baja` and a WhatsApp BAJA write that pair) and refuses with
 `consent_revoked`; false with no date is a lead nobody ever asked and refuses
 with `no_consent` — except for the consent request itself, the one message
-whose purpose is to ask. That exemption is keyed on the template's own
-`plantillas.evento` (`campana.consentimiento`), so it covers
-`consentimiento.solicitud` / `consentimiento.solicitud.email` and nothing
-else, and it never reaches a lead who said no. `src/consent.js` holds it;
+whose purpose is to ask. That exemption needs two conditions on the row:
+`evento = campana.consentimiento` **and** a clave under
+`consentimiento.solicitud`. Either alone is a field any signed-in CRM user can
+edit, so either alone would be a way to reach the never-asked leads with an
+ordinary marketing template. It never reaches a lead who said no. `src/consent.js` holds it;
 the email and WhatsApp paths share the one function.
 
 ## Status taxonomy
