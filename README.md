@@ -26,15 +26,29 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   from_name?}`; or `{lead_id, plantilla, variables?, from_name?}`, which
   resolves the address from the lead, the subject and body from the
   `plantillas` row (`asunto_<idioma>` / `cuerpo_<idioma>`, `{{nombre}}` filled
-  from the lead) and applies the consent gate below (422 `no_consent` /
-  `consent_revoked`). The signed links a body uses — `{{baja_url}}`,
-  `{{si_url}}` — are filled in by the chassis, which alone holds the secret:
-  a caller never supplies them, and a value it sends for one of those names
-  is dropped before anything is rendered. Neither link is ever stored: the
-  `actividades` note and the `envios` variables keep `[si_url]` in its place,
-  because a signed link is a bearer credential and those rows are readable by
-  every signed-in CRM user. With a
-  `lead_id` the opt-out footer (`/baja` link) is appended in the lead's
+  from the lead) and applies the [consent gate](#consent-gate) (422
+  `no_consent` / `consent_revoked`). The signed links a subject or body uses —
+  `{{baja_url}}` (opt-out) and `{{si_url}}` (opt-in, see `/si`) — are filled
+  in by the chassis, which alone holds the secret: a caller never supplies
+  them (and is never refused `variables_missing` for them), and a value it
+  sends for one of those names is dropped before anything is rendered. A
+  template that uses neither gets neither. Without `PUBLIC_URL` or a signing
+  secret the links cannot be minted and the send is refused 400
+  `variables_missing` naming them, never sent with a literal `{{si_url}}`.
+  Neither link is ever stored: the `actividades` note and the `envios`
+  variables keep `[baja_url]` / `[si_url]` in its place, because a signed
+  link is a bearer credential and those rows are readable by every signed-in
+  CRM user; only the email that leaves carries the real URL.
+
+  ```bash
+  curl -X POST "$API/send-email?secret=$OUTBOUND_SECRET" \
+    -H 'Content-Type: application/json' \
+    -d '{"lead_id":"<lead id>","plantilla":"consentimiento.solicitud.email",
+         "variables":{"agencia":"Inmobiliaria Brotea","url":"https://inmobiliaria.brotea.dev"}}'
+  # nombre, si_url and baja_url are filled by the chassis
+  ```
+
+  With a `lead_id` the opt-out footer (`/baja` link) is appended in the lead's
   language. Writes the `actividades` row and an `envios` row
   (`canal: email`, `mensaje_id` = our Message-ID, `estado: enviado`). Answers
   `{ok, message_id, activity_id, envio_id}`.
@@ -45,7 +59,9 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   evidence when they arrive and nothing when they do not.
 - `POST /send-whatsapp` — `{lead_id, plantilla?, variables?, text?,
   actividad_id?, campana_id?}`. The recipient is always the lead's own
-  `telefono` (never a `to` from the request). Inside the 24-hour window (an
+  `telefono` (never a `to` from the request). A template goes through the same
+  [consent gate](#consent-gate) as email (422 `no_consent` /
+  `consent_revoked`, with the consent request exempt). Inside the 24-hour window (an
   inbound WhatsApp activity of the lead in the last 24 h) it sends the rendered
   body as free text (`via: free_text`); outside it, it needs an approved Twilio
   Content template in the lead's language and sends `ContentSid` +
@@ -85,18 +101,38 @@ providers' delivery callbacks, and keeps the `envios` ledger in sync.
   `POST /baja` with the same `lead` and `t` does the write: sets
   `leads.consentimiento = false` with the date and the text, logs
   `lead.consent_revoked {lead_id, via:'email'}`, and shows the confirmation
-  in both languages. A bad token is a 403 page on either verb.
-- `GET /si?lead=&t=` — the opt-in link of the consent campaign, the mirror of
-  `/baja` with its own token (HMAC-SHA256 of `si:<lead id>`, so neither token
-  works on the other route). GET only shows a one-button page for the same
-  reason — consent a mail scanner gave is not consent; `POST /si` sets
-  `leads.consentimiento = true` with the date and the copy that was shown,
-  logs `lead.consent_given {lead_id, via:'email'}` and confirms in the lead's
-  language. The stored text names the request that was answered (`clave vN`
-  of the `envios` row it came from) so the trail points at the exact copy.
-  The event is logged after the write and can never undo it. Idempotent: a lead already consenting is no write and no event.
-  A lead who had opted out and then follows the link is honoured (the click
-  is theirs and it is more recent), and the event carries `after_opt_out`.
+  in both languages. A bad token is a 403 page on either verb. The event is
+  logged after the write; if the events table is down the opt-out still
+  stands and the page still confirms it.
+- `GET /si?lead=&t=` — the opt-in link the consent request carries as
+  `{{si_url}}`, the mirror of `/baja` with its own token (`t` = HMAC-SHA256 of
+  `si:<lead id>`, base64url, same secret as `/baja`, so neither token works on
+  the other route). GET only shows a one-button page for the same reason —
+  consent a mail scanner gave is not consent; `POST /si` (form-encoded, same
+  `lead` and `t`) does the write:
+
+  ```bash
+  curl "$API/si?lead=<lead id>&t=<token>"                       # 200, the button
+  curl -X POST "$API/si" -d 'lead=<lead id>' -d 't=<token>'     # 200, the write
+  ```
+
+  It sets `leads.consentimiento = true`, `consentimiento_en` = now and
+  `consentimiento_texto` = the copy the page showed (`si_ask` + `si_confirm`
+  in the lead's language) followed by `[clave vN]` — the clave and the
+  version actually sent, read from the lead's latest `envios` row for the
+  email consent request (just the copy when there is none), capped at 300
+  characters. Then it logs `lead.consent_given {lead_id, via:'email'}`; the
+  event is logged after the write and can never undo it. Idempotent: a lead
+  already consenting is no write and no event, and still sees the
+  confirmation. A lead who had opted out and then follows the link is
+  honoured (the click is theirs and it is more recent), and the event
+  carries `after_opt_out: true`. Responses are HTML pages with
+  `Cache-Control: no-store`: 200 ask / done; 403 for a bad token (including a
+  `/baja` token) or an unknown lead, the same page either way so the route
+  never reveals which lead ids exist; 503 when PocketBase is not configured
+  and 502 when it fails (POST only — a GET never touches PocketBase). The ask
+  and invalid pages are bilingual; the confirmation is in the lead's
+  language alone.
 
 ## Language convention
 
@@ -111,21 +147,36 @@ approved gets a 422 `template_not_approved`, not the Spanish template.
 
 The chassis's own copy (the `/baja` and `/si` pages, the footer, the refusal
 and error sentences) lives in `src/locales/es.json` and `en.json` with
-identical key sets; nothing user-facing is hardcoded in JS.
+identical key sets; nothing user-facing is hardcoded in JS. A click tells
+the chassis nothing about the reader's language, so the `/baja` pages and the
+`/si` ask and invalid pages show both languages; the `/si` confirmation,
+rendered after the write has read the lead, shows only `leads.idioma`.
 
 ## Consent gate
 
-`leads` has three consent states, not two, and marketing reads all three:
-`consentimiento` true sends; false **with** a `consentimiento_en` date is an
-opt-out (only `/baja` and a WhatsApp BAJA write that pair) and refuses with
-`consent_revoked`; false with no date is a lead nobody ever asked and refuses
-with `no_consent` — except for the consent request itself, the one message
-whose purpose is to ask. That exemption needs two conditions on the row:
-`evento = campana.consentimiento` **and** a clave under
-`consentimiento.solicitud`. Either alone is a field any signed-in CRM user can
-edit, so either alone would be a way to reach the never-asked leads with an
-ordinary marketing template. It never reaches a lead who said no. `src/consent.js` holds it;
-the email and WhatsApp paths share the one function.
+Only `categoria: marketing` templates are gated; a utility template (a visit
+confirmation) goes to any lead, opted out or not. For marketing, `leads` has
+three consent states, not two:
+
+| Lead | Marketing template | Consent request |
+|---|---|---|
+| `consentimiento` true | sent | sent |
+| false **with** a `consentimiento_en` date (opted out) | 422 `consent_revoked` | 422 `consent_revoked` |
+| false, no date (never asked) | 422 `no_consent` | sent |
+
+Only `/baja` and a WhatsApp BAJA write the false + date pair, so it is an
+act, not a blank. The consent request is the one message whose purpose is to
+ask, so it cannot require consent — without the exemption CU-15 would be
+refused for every never-asked lead. It is exempt when the row has **both**
+`evento = campana.consentimiento` **and** a clave starting with
+`consentimiento.solicitud` (today `consentimiento.solicitud` on WhatsApp and
+`consentimiento.solicitud.email`). Either field alone is editable by any
+signed-in CRM user, so either alone would be a way to reach the never-asked
+leads with an ordinary marketing template; any other marketing template is
+still refused `no_consent`. The exemption never reaches a lead who said no.
+`consentGate` in `src/consent.js` holds it; `/send-email` and
+`/send-whatsapp` share the one function (on WhatsApp, outside the 24-hour
+window the Content template must still be approved by Meta).
 
 ## Status taxonomy
 
@@ -153,7 +204,7 @@ Actor `chassis`: `whatsapp.sent {lead_id, envio_id, plantilla, via, mensaje_id}`
 `whatsapp.send_failed {…, code}`, `whatsapp.refused {lead_id, plantilla, code}`,
 `whatsapp.sent_unrecorded`, `content.submitted`, `content.submit_failed`,
 `content.synced`, `content.sync_failed`, `lead.consent_revoked {lead_id,
-via:'email'}`. Actor `twilio`: `whatsapp.status_received {mensaje_id, status,
+via:'email'}`, `lead.consent_given {lead_id, via:'email', after_opt_out?}`. Actor `twilio`: `whatsapp.status_received {mensaje_id, status,
 result}` on every callback. Actor `brevo`: `email.event_received`. The historic
 routes keep actor `requirements-api`. Payloads by the `chassis` and `twilio`
 actors carry ids, never a phone, an email or a message body (the historic
@@ -170,8 +221,9 @@ The CRM's PocketBase: `PB_URL`, `PB_ADMIN_EMAIL`, `PB_ADMIN_PASS`, `PB_PROJECT`
 public origin, e.g. `https://api.brotea.dev` — it goes into every
 `StatusCallback` and is what the callback signature is computed over),
 `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` (with or
-without the `whatsapp:` prefix; normalised). Optional `BAJA_SECRET` signs the
-opt-out links (falls back to `OUTBOUND_SECRET`).
+without the `whatsapp:` prefix; normalised). `PUBLIC_URL` is also the origin
+of the `/baja` and `/si` links. Optional `BAJA_SECRET` signs both the opt-out
+and the opt-in links (falls back to `OUTBOUND_SECRET`).
 
 ## Layout
 
@@ -181,7 +233,9 @@ the signature check copied verbatim from the platform's
 `whatsapp/src/transports/twilio.js`, the status map and rank, and the thin
 caller; its header records the provider references and the date they were
 read. `src/whatsapp.js` and `src/content.js` are the flows, `src/email.js` the
-email relay, `src/consent.js` the opt-out, `src/templates.js` the placeholder
+email relay and template resolution (`resolveTemplateEmail`),
+`src/consent.js` the consent gate, the signed `/baja` and `/si` links and
+their writes, `src/baja.js` the two pages, `src/templates.js` the placeholder
 rules, `src/window.js` the 24-hour window. Tests run against fakes
 (`tests/helpers/fake-pb.mjs`, `fake-pg.mjs`): `npm test`, no network.
 
