@@ -3,10 +3,13 @@
 // Why here and not in the CRM: the SMTP credentials must never reach a
 // browser, and the Brevo webhook needs a public receiver. The CRM calls
 // POST /send-email; Brevo calls POST /brevo-webhook with delivery events;
-// both sides converge on the PocketBase `actividades` record identified by
-// its Message-ID, so the CRM sees "abierto" without polling anything.
+// both sides converge on the PocketBase `actividades` record and the
+// `envios` ledger row identified by the Message-ID we mint ourselves, so
+// the CRM sees "entregado" or "abierto" without polling anything.
 import { createTransport } from 'nodemailer';
 import { randomBytes } from 'node:crypto';
+import { locale, t } from './copy.js';
+import { RANK, moves } from './twilio.js';
 
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT ?? 587);
@@ -72,10 +75,6 @@ export async function pb(method, path, body, { retry = true } = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-/**
- * Send one email and record it as a lead activity.
- * Returns { message_id, activity_id }.
- */
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 /** Plain text → simple HTML. Open tracking needs an HTML part: the provider
@@ -85,35 +84,63 @@ const textoAHtml = (text) =>
   text.split(/\n{2,}/).map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`).join('') +
   `</body></html>`;
 
-export async function sendTrackedEmail({ to, subject, text, leadId, fromName, html }) {
+/**
+ * Send one email, record it as a lead activity and as an `envios` row.
+ * With `leadId` and `bajaUrl` the opt-out footer is appended in the lead's
+ * language. Returns { message_id, activity_id, envio_id, smtp }.
+ */
+export async function sendTrackedEmail({ to, subject, text, leadId, fromName, html, plantilla, plantillaVersion, variables, bajaUrl, idioma }, deps = {}) {
+  const pbCall = deps.pb ?? pb;
+  const pbReady = deps.pb ? true : pbConfigured();
+  const now = deps.now ?? new Date();
+  const footer = leadId && bajaUrl ? `\n\n${t(locale(idioma), 'email_footer_baja', { url: bajaUrl })}` : '';
+  const body = `${text}${footer}`;
   // Our own Message-ID is the join key with Brevo's webhook events.
   const messageId = `<lead-${leadId ?? 'na'}-${randomBytes(8).toString('hex')}@brotea.dev>`;
-  const info = await getTransport().sendMail({
+  const info = await (deps.sendMail ?? ((m) => getTransport().sendMail(m)))({
     from: fromName ? `${fromName} <${MAIL_FROM}>` : MAIL_FROM,
-    to, subject, text, messageId,
-    html: html || textoAHtml(text),
+    to, subject, text: body, messageId,
+    html: html ? (footer ? html.replace(/<\/body>/i, `<p>${esc(footer.trim())}</p></body>`) : html) : textoAHtml(body),
     // Brevo relays these as its own tracking tags.
     headers: { 'X-Mailin-custom': `lead:${leadId ?? ''}` },
   });
 
   let activityId = null;
-  if (leadId && pbConfigured()) {
-    const act = await pb('POST', '/api/collections/actividades/records', {
+  let envioId = null;
+  if (leadId && pbReady) {
+    const act = await pbCall('POST', '/api/collections/actividades/records', {
       lead: leadId, tipo: 'email', direccion: 'saliente',
       asunto: subject, nota: text.slice(0, 2000),
       estado_envio: 'enviado', mensaje_id: messageId,
     });
     activityId = act.id;
-    await pb('PATCH', `/api/collections/leads/records/${leadId}`, {
-      ultimo_contacto: new Date().toISOString(),
+    await pbCall('PATCH', `/api/collections/leads/records/${leadId}`, {
+      ultimo_contacto: now.toISOString(),
     });
   }
-  return { message_id: messageId, activity_id: activityId, smtp: info.response };
+  if (pbReady) {
+    // The ledger row never fails a send that already left: a miss here is
+    // an events row on the caller's side, with the Message-ID to reconcile.
+    try {
+      const envio = await pbCall('POST', '/api/collections/envios/records', {
+        ...(leadId ? { lead: leadId } : {}),
+        ...(plantilla ? { plantilla, plantilla_version: Number(plantillaVersion) || 1 } : {}),
+        ...(activityId ? { actividad: activityId } : {}),
+        canal: 'email', mensaje_id: messageId, estado: 'enviado', enviado_en: now.toISOString(),
+        ...(variables ? { variables } : {}),
+      });
+      envioId = envio.id;
+    } catch (e) {
+      console.error('envios write failed:', e.message);
+    }
+  }
+  return { message_id: messageId, activity_id: activityId, envio_id: envioId, smtp: info?.response ?? null };
 }
 
-// Brevo event names → our estado_envio vocabulary. Ordered by progress so a
-// late "delivered" never overwrites an earlier "opened".
-const RANK = { enviado: 1, entregado: 2, abierto: 3, click: 4, error: 5 };
+// Brevo event names → our estado vocabulary. The rank (shared with the
+// WhatsApp ledger in twilio.js) keeps a late "delivered" from overwriting an
+// earlier "opened".
+export { RANK };
 const MAP = {
   delivered: 'entregado',
   opened: 'abierto',
@@ -128,21 +155,42 @@ const MAP = {
   request: null,
 };
 
-/** Apply one Brevo delivery event to its activity. Returns what it did. */
-export async function applyBrevoEvent(payload) {
+/**
+ * Apply one Brevo delivery event to its activity and its envios row, each
+ * under the never-backwards rule. Returns what it did on both:
+ * {updated|skipped, estado?, envio: {updated|skipped}}.
+ */
+export async function applyBrevoEvent(payload, deps = {}) {
   const estado = MAP[payload.event];
   const messageId = payload['message-id'] ?? payload.messageId;
   if (!estado || !messageId) return { skipped: true, event: payload.event };
-  if (!pbConfigured()) return { skipped: true, reason: 'pb not configured' };
+  const pbCall = deps.pb ?? pb;
+  if (!deps.pb && !pbConfigured()) return { skipped: true, reason: 'pb not configured' };
+  const now = deps.now ?? new Date();
+  const filter = encodeURIComponent(`mensaje_id="${String(messageId).replace(/"/g, '')}"`);
 
-  const found = await pb('GET',
-    `/api/collections/actividades/records?perPage=1&filter=${encodeURIComponent(`mensaje_id="${messageId}"`)}`);
+  let result;
+  const found = await pbCall('GET', `/api/collections/actividades/records?perPage=1&filter=${filter}`);
   const act = found.items?.[0];
-  if (!act) return { skipped: true, reason: 'activity not found' };
-  // No degradar el estado (los eventos llegan desordenados).
-  if ((RANK[estado] ?? 0) <= (RANK[act.estado_envio] ?? 0)) {
-    return { skipped: true, reason: 'already further along', estado: act.estado_envio };
+  if (!act) result = { skipped: true, reason: 'activity not found' };
+  else if ((RANK[estado] ?? 0) <= (RANK[act.estado_envio] ?? 0)) result = { skipped: true, reason: 'already further along', estado: act.estado_envio };
+  else {
+    await pbCall('PATCH', `/api/collections/actividades/records/${act.id}`, { estado_envio: estado });
+    result = { updated: act.id, estado };
   }
-  await pb('PATCH', `/api/collections/actividades/records/${act.id}`, { estado_envio: estado });
-  return { updated: act.id, estado };
+
+  const ledger = await pbCall('GET', `/api/collections/envios/records?perPage=1&filter=${filter}`);
+  const row = ledger.items?.[0];
+  if (!row) result.envio = { skipped: true, reason: 'unknown message' };
+  else if (!moves(row.estado, estado)) result.envio = { skipped: true, reason: row.estado === 'simulado' ? 'simulated' : 'already further along', estado: row.estado };
+  else {
+    const patch = { estado, [`${estado}_en`]: now.toISOString() };
+    if (estado === 'error') {
+      patch.error_codigo = String(payload.event);
+      patch.error_texto = String(payload.reason ?? payload.event).slice(0, 300);
+    }
+    await pbCall('PATCH', `/api/collections/envios/records/${row.id}`, patch);
+    result.envio = { updated: row.id, estado };
+  }
+  return result;
 }

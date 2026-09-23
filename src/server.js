@@ -2,8 +2,15 @@ import http from 'node:http';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
-import { sendTrackedEmail, applyBrevoEvent, emailConfigured } from './email.js';
+import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb } from './email.js';
 import { assignWebLead } from './assign.js';
+import { locale, t } from './copy.js';
+import { loadTemplate, missingVariables, render, variableNames } from './templates.js';
+import { twilioCaller, validSignature, whatsappAddress } from './twilio.js';
+import { applyTwilioStatus, sendWhatsapp } from './whatsapp.js';
+import { submitContent, syncContent } from './content.js';
+import { bajaUrl, revokeByEmail, validBajaToken } from './consent.js';
+import { bajaPage } from './baja.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const PORT = Number(process.env.PORT ?? 3000);
@@ -50,10 +57,30 @@ async function sendToProjectTopic(projectId, text) {
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?${params}`);
 }
 
-const logEvent = (type, payload) => pool.query(
+/** An events writer for one actor. The historic routes log as requirements-api; the messaging ones as chassis / twilio. */
+const logAs = (actor) => (type, payload) => pool.query(
   'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
-  ['requirements-api', type, payload],
+  [actor, type, payload],
 );
+const logEvent = logAs('requirements-api');
+const logChassis = logAs('chassis');
+const logTwilio = logAs('twilio');
+
+// -- messaging configuration -----------------------------------------------------
+// PUBLIC_URL is the exact origin Twilio calls back on: it goes into every
+// StatusCallback and is the URL the callback's signature is computed over.
+// The sender is normalised so `From` is `whatsapp:+…` whether or not the env
+// carries the prefix.
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? '').replace(/\/$/, '');
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM ? whatsappAddress(process.env.TWILIO_WHATSAPP_FROM) : null;
+const whatsappConfigured = () => !!(PUBLIC_URL && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_WHATSAPP_FROM);
+const contentConfigured = () => !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
+let twilioCall;
+const twilio = (req) => (twilioCall ??= twilioCaller({ accountSid: TWILIO_ACCOUNT_SID, authToken: TWILIO_AUTH_TOKEN }))(req);
+/** The opt-out link is signed with its own secret when one is set; the shared outbound secret otherwise. */
+const bajaSecret = () => process.env.BAJA_SECRET || process.env.OUTBOUND_SECRET || null;
 
 function notifyTopic(projectId, projectName, content, submittedBy) {
   const excerpt = content.length > 300 ? `${content.slice(0, 300)}…` : content;
@@ -178,36 +205,153 @@ async function readJson(req, res) {
   }
 }
 
+/** A form-encoded body (Twilio's callbacks) as a plain object, capped like the JSON bodies. */
+async function readForm(req, res) {
+  let raw = '';
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > MAX_BODY) { send(res, 413, { error: 'body too large' }); return null; }
+  }
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const refusal = (res, status, code, vars) => send(res, status, { ok: false, error: { code, text: t('es', `refusal.${code}`, vars) } });
+
+/**
+ * Two shapes: the legacy {to, subject, text} and {lead_id, plantilla,
+ * variables}, which resolves the address, subject and body from the lead
+ * and the `plantillas` row in the lead's language. Both may carry from_name.
+ */
 async function handleSendEmail(req, res, url) {
   if (!OUTBOUND_SECRET) return send(res, 503, { error: 'outbound email not configured' });
   if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
 
   const data = await readJson(req, res);
   if (!data) return undefined;
-  const to = String(data.to ?? '').trim();
-  const subject = String(data.subject ?? '').trim();
-  const text = String(data.text ?? '').trim();
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) return send(res, 400, { error: 'invalid to' });
+  const leadId = data.lead_id ? String(data.lead_id) : null;
+  const clave = data.plantilla ? String(data.plantilla).trim() : '';
+  const fromName = data.from_name ? String(data.from_name).slice(0, 100) : null;
+  let to = String(data.to ?? '').trim();
+  let subject = String(data.subject ?? '').trim();
+  let text = String(data.text ?? '').trim();
+  let plantilla = null; let values = null; let idioma = 'es';
+
+  if (clave) {
+    if (!leadId) return refusal(res, 400, 'lead_required');
+    if (!pbConfigured()) return send(res, 503, { error: 'pocketbase not configured' });
+    let lead;
+    try {
+      lead = await pb('GET', `/api/collections/leads/records/${encodeURIComponent(leadId)}`);
+    } catch (e) {
+      if (e.status === 404) return refusal(res, 404, 'lead_unknown');
+      throw e;
+    }
+    const loaded = await loadTemplate(pb, clave, 'email');
+    if (loaded.code) return refusal(res, loaded.code === 'template_unknown' ? 404 : loaded.code === 'template_retired' ? 422 : 400, loaded.code, { canal: 'email' });
+    plantilla = loaded.plantilla;
+    to = String(lead.email ?? '').trim();
+    if (!EMAIL_RE.test(to)) return refusal(res, 400, 'no_email');
+    if (plantilla.categoria === 'marketing' && !lead.consentimiento) return refusal(res, 422, 'no_consent');
+    idioma = locale(lead.idioma);
+    const names = variableNames(plantilla);
+    values = { nombre: lead.nombre || '', ...(data.variables && typeof data.variables === 'object' ? data.variables : {}) };
+    const missing = missingVariables(names, values);
+    if (missing.length) return refusal(res, 400, 'variables_missing', { names: missing.join(', ') });
+    subject = render(plantilla[`asunto_${idioma}`] || plantilla.asunto_es || '', values).trim();
+    text = render(plantilla[`cuerpo_${idioma}`] || plantilla.cuerpo_es || '', values).trim();
+  }
+  if (!EMAIL_RE.test(to)) return send(res, 400, { error: 'invalid to' });
   if (!subject || !text) return send(res, 400, { error: 'subject and text required' });
-  // La configuración se comprueba tras validar: una petición mal formada es
-  // un 400 aunque el relay no esté montado.
+  // Configuration is checked after validation: a malformed request is a 400
+  // even when the relay is not mounted.
   if (!emailConfigured()) return send(res, 503, { error: 'smtp not configured' });
 
   try {
     const out = await sendTrackedEmail({
-      to, subject, text,
-      leadId: data.lead_id ? String(data.lead_id) : null,
-      fromName: data.from_name ? String(data.from_name).slice(0, 100) : null,
+      to, subject, text, leadId, fromName, idioma,
+      plantilla: plantilla?.id ?? null, plantillaVersion: plantilla?.version ?? null, variables: values,
+      bajaUrl: leadId && PUBLIC_URL && bajaSecret() ? bajaUrl(PUBLIC_URL, leadId, bajaSecret()) : null,
     });
-    await pool.query(
-      'INSERT INTO events (actor, event_type, payload) VALUES ($1, $2, $3)',
-      ['requirements-api', 'email.sent', { to, subject, lead_id: data.lead_id ?? null }],
-    );
+    await logEvent('email.sent', { to, subject, lead_id: leadId, envio_id: out.envio_id, plantilla: clave || null });
     return send(res, 200, { ok: true, ...out });
   } catch (e) {
     console.error('send-email failed:', e.message);
     return send(res, 502, { error: 'send failed', detail: e.message.slice(0, 200) });
   }
+}
+
+// -- WhatsApp through Twilio ------------------------------------------------------
+// The browser never holds the Twilio credentials: the CRM (and the WhatsApp
+// service) post here with the shared secret, and the chassis only ever sends
+// to the phone on the `leads` row named — never to a `to` from the request.
+async function handleSendWhatsapp(req, res, url) {
+  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
+  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const data = await readJson(req, res);
+  if (!data) return undefined;
+  if (!whatsappConfigured() || !pbConfigured()) return send(res, 503, { error: 'not configured' });
+  const out = await sendWhatsapp(data, {
+    pb, twilio, logEvent: logChassis, publicUrl: PUBLIC_URL, from: TWILIO_WHATSAPP_FROM, accountSid: TWILIO_ACCOUNT_SID,
+  });
+  return send(res, out.status, out.body);
+}
+
+// Twilio's status callback. No secret in the URL: the signature over the
+// exact public URL is the authentication, and after it the answer is always
+// 200 (Twilio retries anything else). Every call leaves an events row.
+async function handleTwilioStatus(req, res) {
+  if (!TWILIO_AUTH_TOKEN || !PUBLIC_URL) return send(res, 503, { error: 'not configured' });
+  const form = await readForm(req, res);
+  if (!form) return undefined;
+  if (!validSignature(TWILIO_AUTH_TOKEN, `${PUBLIC_URL}${req.url}`, form, req.headers['x-twilio-signature'])) {
+    return send(res, 403, { error: 'forbidden' });
+  }
+  let result;
+  try {
+    result = pbConfigured() ? await applyTwilioStatus(form, { pb }) : { skipped: true, reason: 'pb not configured' };
+  } catch (e) {
+    console.error('twilio status failed:', e.message);
+    result = { skipped: true, reason: 'ledger unavailable', error: e.message.slice(0, 200) };
+  }
+  logTwilio('whatsapp.status_received', { mensaje_id: form.MessageSid ?? null, status: form.MessageStatus ?? null, result })
+    .catch((e) => console.error('event log failed:', e.message));
+  return send(res, 200, { ok: true, ...result });
+}
+
+// Twilio Content: submit a `plantillas` row for WhatsApp approval, and read
+// the approval state of every submitted row back.
+async function handleContent(req, res, url, action) {
+  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
+  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const data = await readJson(req, res);
+  if (!data) return undefined;
+  if (!contentConfigured() || !pbConfigured()) return send(res, 503, { error: 'not configured' });
+  const clave = data.clave ? String(data.clave).trim() : '';
+  if (action === 'submit' && !clave) return send(res, 400, { ok: false, error: { code: 'clave_required' } });
+  const out = action === 'submit'
+    ? await submitContent({ clave }, { pb, twilio, logEvent: logChassis })
+    : await syncContent({ clave: clave || undefined }, { pb, twilio, logEvent: logChassis });
+  return send(res, out.status, out.body);
+}
+
+// The opt-out link from an email footer. A page, not JSON: a person clicks it.
+async function handleBaja(req, res, url) {
+  const leadId = url.searchParams.get('lead') ?? '';
+  const token = url.searchParams.get('t') ?? '';
+  const page = (status, result) => {
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(bajaPage(result));
+  };
+  if (!bajaSecret() || !validBajaToken(leadId, token, bajaSecret())) return page(403, 'invalid');
+  if (!pbConfigured()) return page(503, 'invalid');
+  try {
+    await revokeByEmail(leadId, { pb, logEvent: logChassis });
+  } catch (e) {
+    console.error('baja failed:', e.message);
+    return page(e.status === 404 ? 403 : 502, 'invalid');
+  }
+  return page(200, 'done');
 }
 
 // Brevo delivery events (delivered / opened / click / bounce…). Brevo cannot
@@ -371,6 +515,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/glitchtip-webhook') return await handleGlitchtipAlert(req, res, url);
     if (req.method === 'POST' && url.pathname === '/send-email') return await handleSendEmail(req, res, url);
     if (req.method === 'POST' && url.pathname === '/brevo-webhook') return await handleBrevoWebhook(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/send-whatsapp') return await handleSendWhatsapp(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/twilio-status') return await handleTwilioStatus(req, res);
+    if (req.method === 'POST' && url.pathname === '/content/submit') return await handleContent(req, res, url, 'submit');
+    if (req.method === 'POST' && url.pathname === '/content/sync') return await handleContent(req, res, url, 'sync');
+    if (req.method === 'GET' && url.pathname === '/baja') return await handleBaja(req, res, url);
     return send(res, 404, { error: 'not found' });
   } catch (e) {
     console.error('request error:', e);

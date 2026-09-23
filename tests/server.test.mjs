@@ -143,6 +143,38 @@ test('POST /send-email without SMTP config reports it', async () => {
   assert.equal(r.status, 503);
 });
 
+test('POST /send-whatsapp, /content/submit and /content/sync without the secret are forbidden, not unknown', async () => {
+  for (const p of ['/send-whatsapp', '/content/submit', '/content/sync']) {
+    const r = await fetch(`${BASE}${p}`, { method: 'POST', body: '{}' });
+    assert.equal(r.status, 403, p);
+  }
+});
+
+test('POST /send-whatsapp with the secret but no PUBLIC_URL / TWILIO_* reports 503', async () => {
+  const r = await fetch(`${BASE}/send-whatsapp?secret=test-outbound`, {
+    method: 'POST',
+    body: JSON.stringify({ lead_id: 'abcdefghijklmno', text: 'hola' }),
+  });
+  assert.equal(r.status, 503);
+  const bad = await fetch(`${BASE}/send-whatsapp?secret=test-outbound`, { method: 'POST', body: 'nope' });
+  assert.equal(bad.status, 400);
+});
+
+test('POST /twilio-status without the Twilio config is 503, never a silent 200', async () => {
+  const r = await fetch(`${BASE}/twilio-status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ MessageSid: 'SM1', MessageStatus: 'delivered' }),
+  });
+  assert.equal(r.status, 503);
+});
+
+test('GET /baja with a bad token is a 403 page', async () => {
+  const r = await fetch(`${BASE}/baja?lead=x&t=y`);
+  assert.equal(r.status, 403);
+  assert.match(r.headers.get('content-type'), /text\/html/);
+});
+
 test('POST /brevo-webhook without secret is forbidden', async () => {
   const r = await fetch(`${BASE}/brevo-webhook`, { method: 'POST', body: '{}' });
   assert.equal(r.status, 403);
