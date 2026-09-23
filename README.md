@@ -14,6 +14,10 @@ Tiny ingestion endpoint for Brotea landing-page requirement forms.
 - `GET /health` — liveness.
 
 Env: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `PORT`
-(via Coolify — never committed).
+(via Coolify — never committed). Lead assignment and `/send-email` also need
+the CRM's PocketBase: `PB_URL`, `PB_ADMIN_EMAIL`, `PB_ADMIN_PASS`, and
+`PB_PROJECT` (the project slug that instance belongs to; default
+`inmobiliaria`). Without them, or for another project, the lead is not
+assigned and a `lead.assign_skipped` event says why.
 
 Part of the [Brotea](https://github.com/BroteaConnect) platform.

@@ -68,6 +68,20 @@ test('POST /requirements with a web lead still answers 201 when assignment fails
   assert.ok(failed.payload.error);
 });
 
+test('POST /requirements for a web lead without lead_id is 201 and records the gap', async () => {
+  // The landing that sends lead_id is in flight; until it lands, every web
+  // lead takes this path and the events table has to show it.
+  const r = await fetch(`${BASE}/requirements`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: 'inmobiliaria', source: 'lead_web', content: 'LEAD sin id' }),
+  });
+  assert.equal(r.status, 201);
+  const skipped = events().filter((e) => e.type === 'lead.assign_skipped');
+  assert.equal(skipped.length, 1);
+  assert.deepEqual(skipped[0].payload, { project: 'inmobiliaria', lead_id: '', reason: 'no lead id' });
+});
+
 test('POST /requirements from another source never touches the lead', async () => {
   const r = await fetch(`${BASE}/requirements`, {
     method: 'POST',
@@ -76,5 +90,5 @@ test('POST /requirements from another source never touches the lead', async () =
   });
   assert.equal(r.status, 201);
   const types = events().map((e) => e.type);
-  assert.deepEqual(types.filter((t) => t.startsWith('lead.')).length, 1, 'only the earlier failure');
+  assert.deepEqual(types.filter((t) => t.startsWith('lead.')), ['lead.assign_failed', 'lead.assign_skipped'], 'only the earlier two');
 });
