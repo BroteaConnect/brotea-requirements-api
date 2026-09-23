@@ -2,7 +2,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import pg from 'pg';
-import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb, resolveTemplateEmail } from './email.js';
+import { sendTrackedEmail, applyBrevoEvent, emailConfigured, pbConfigured, pb, resolveLeadEmail, resolveTemplateEmail } from './email.js';
 import { assignWebLead } from './assign.js';
 import { t } from './copy.js';
 import { twilioCaller, validSignature, whatsappAddress } from './twilio.js';
@@ -10,6 +10,7 @@ import { applyTwilioStatus, sendWhatsapp } from './whatsapp.js';
 import { submitContent, syncContent } from './content.js';
 import { bajaUrl, grantByEmail, revokeByEmail, validBajaToken, validSiToken } from './consent.js';
 import { bajaPage, siPage } from './baja.js';
+import { STAFF_ROLES, authorize, verifyUserToken } from './auth.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
 const PORT = Number(process.env.PORT ?? 3000);
@@ -35,7 +36,9 @@ function send(res, status, body, headers = {}) {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    // The CRM now authenticates with its user's PocketBase token, so the
+    // preflight must allow the header that carries it.
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     ...headers,
   });
   res.end(JSON.stringify(body));
@@ -186,9 +189,54 @@ async function handleGlitchtipAlert(req, res, url) {
 }
 
 // Outbound email for CRMs: the browser must never hold SMTP credentials, so
-// the CRM posts here with the shared secret. Delivery tracking arrives later
-// via /brevo-webhook and lands on the same activity record.
+// it asks the chassis to send instead. Delivery tracking arrives later via
+// /brevo-webhook and lands on the same activity record.
 const OUTBOUND_SECRET = process.env.OUTBOUND_SECRET;
+
+// -- who may call the endpoints a browser calls ----------------------------------
+// Two credentials, never interchangeable (src/auth.js says why at length): the
+// CRM sends `Authorization: Bearer <PocketBase user token>`, the host processes
+// keep `?secret=`. /twilio-status and /brevo-webhook are NOT gated here on
+// purpose — a provider callback authenticates as the provider, and asking Twilio
+// for a person's token is how a delivery state stops being recorded.
+const PB_AUTH_COLLECTION = process.env.PB_AUTH_COLLECTION || 'users';
+const configuredRoles = String(process.env.PB_STAFF_ROLES || '').split(',').map((r) => r.trim()).filter(Boolean);
+const staffRoles = configuredRoles.length ? configuredRoles : STAFF_ROLES;
+
+/** An events write that can never turn a refusal into a 500. */
+const safeLog = (type, payload) =>
+  Promise.resolve().then(() => logChassis(type, payload)).catch((e) => console.error(`event ${type} not logged:`, e.message));
+
+/**
+ * The caller behind one request, or null once the refusal has been answered.
+ *
+ * Every outcome leaves an events row carrying ids and codes only — never a
+ * token, never the secret, never an address. `secret_from_browser` is the one
+ * this gate exists to make visible: it is a bundle leaking a credential, and it
+ * should be readable in `events` the day it happens rather than the day
+ * somebody fetches the bundle.
+ */
+async function caller(req, res, url, route) {
+  const decision = await authorize(
+    { headers: req.headers, secretParam: url.searchParams.get('secret') },
+    {
+      secret: OUTBOUND_SECRET ?? null,
+      pbConfigured: pbConfigured(),
+      verify: (token) => verifyUserToken(token, {
+        pbUrl: process.env.PB_URL, collection: PB_AUTH_COLLECTION, roles: staffRoles,
+      }),
+    },
+  );
+  if (decision.ok) {
+    if (decision.via === 'user') {
+      safeLog('chassis.authorized', { route, via: 'user', user_id: decision.user.id, role: decision.user.role });
+    }
+    return decision;
+  }
+  safeLog('chassis.refused', { route, code: decision.code, status: decision.status });
+  send(res, decision.status, { ok: false, error: { code: decision.code, text: t('es', `refusal.${decision.code}`) } });
+  return null;
+}
 
 async function readJson(req, res, { optional = false } = {}) {
   let raw = '';
@@ -219,27 +267,37 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const refusal = (res, status, code, vars) => send(res, status, { ok: false, error: { code, text: t('es', `refusal.${code}`, vars) } });
 
 /**
- * Two shapes: the legacy {to, subject, text} and {lead_id, plantilla,
- * variables}, which resolves the address, subject and body from the lead
- * and the `plantillas` row in the lead's language. Both may carry from_name.
+ * Two shapes, both naming a lead and neither naming an address:
+ * {lead_id, subject, text} for free text the agent wrote, and
+ * {lead_id, plantilla, variables}, which resolves subject and body from the
+ * `plantillas` row in the lead's language. Both may carry from_name.
+ *
+ * `to` is no longer part of either. It used to be, and an arbitrary recipient
+ * plus a credential that shipped inside a public JS bundle is an open mail
+ * relay over the agency's own SMTP identity, SPF and DKIM. Nothing on the host
+ * ever used that shape (checked: only the E5 gate, which posts `{}` and asserts
+ * a 403), so it is gone for every caller rather than kept for one — a relay
+ * that only trusted callers may use is still a relay, and the trust was the
+ * part that failed.
  */
 async function handleSendEmail(req, res, url) {
-  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'outbound email not configured' });
-  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const who = await caller(req, res, url, '/send-email');
+  if (!who) return undefined;
 
   const data = await readJson(req, res);
   if (!data) return undefined;
   const leadId = data.lead_id ? String(data.lead_id) : null;
   const clave = data.plantilla ? String(data.plantilla).trim() : '';
   const fromName = data.from_name ? String(data.from_name).slice(0, 100) : null;
-  let to = String(data.to ?? '').trim();
+  let to = '';
   let subject = String(data.subject ?? '').trim();
   let text = String(data.text ?? '').trim();
   let plantilla = null; let values = null; let idioma = 'es';
 
+  if (!leadId) return refusal(res, 400, 'lead_required');
+  if (!pbConfigured()) return send(res, 503, { error: 'pocketbase not configured' });
+
   if (clave) {
-    if (!leadId) return refusal(res, 400, 'lead_required');
-    if (!pbConfigured()) return send(res, 503, { error: 'pocketbase not configured' });
     const resolved = await resolveTemplateEmail(
       { leadId, clave, given: data.variables },
       { pb, publicUrl: PUBLIC_URL, secret: bajaSecret() },
@@ -247,8 +305,12 @@ async function handleSendEmail(req, res, url) {
     if (resolved.code) return refusal(res, resolved.status, resolved.code, resolved.vars);
     ({ to, subject, text, idioma, values } = resolved);
     plantilla = resolved.plantilla;
+  } else {
+    const resolved = await resolveLeadEmail(leadId, { pb });
+    if (resolved.code) return refusal(res, resolved.status, resolved.code, resolved.vars);
+    ({ to, idioma } = resolved);
   }
-  if (!EMAIL_RE.test(to)) return send(res, 400, { error: 'invalid to' });
+  if (!EMAIL_RE.test(to)) return refusal(res, 400, 'no_email');
   if (!subject || !text) return send(res, 400, { error: 'subject and text required' });
   // Configuration is checked after validation: a malformed request is a 400
   // even when the relay is not mounted.
@@ -273,8 +335,8 @@ async function handleSendEmail(req, res, url) {
 // service) post here with the shared secret, and the chassis only ever sends
 // to the phone on the `leads` row named — never to a `to` from the request.
 async function handleSendWhatsapp(req, res, url) {
-  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
-  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const who = await caller(req, res, url, '/send-whatsapp');
+  if (!who) return undefined;
   const data = await readJson(req, res);
   if (!data) return undefined;
   if (!whatsappConfigured() || !pbConfigured()) return send(res, 503, { error: 'not configured' });
@@ -309,8 +371,8 @@ async function handleTwilioStatus(req, res) {
 // Twilio Content: submit a `plantillas` row for WhatsApp approval, and read
 // the approval state of every submitted row back.
 async function handleContent(req, res, url, action) {
-  if (!OUTBOUND_SECRET) return send(res, 503, { error: 'not configured' });
-  if (url.searchParams.get('secret') !== OUTBOUND_SECRET) return send(res, 403, { error: 'forbidden' });
+  const who = await caller(req, res, url, `/content/${action}`);
+  if (!who) return undefined;
   // The body is optional on both: /content/sync without one syncs every row.
   const data = await readJson(req, res, { optional: true });
   if (!data) return undefined;

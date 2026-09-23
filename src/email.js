@@ -98,6 +98,29 @@ const REFUSAL_STATUS = {
 const refuse = (code, vars) => ({ code, status: REFUSAL_STATUS[code] ?? 400, vars });
 
 /**
+ * The address a free-text email goes to: the `leads` row's, never the
+ * caller's. Resolves {to, idioma, lead} or {code, status}.
+ *
+ * This is the whole of the open-relay fix. The endpoint used to take `to`
+ * straight off the request, which turned the agency's SMTP identity — its
+ * domain, its SPF, its DKIM — into a relay for whoever held the credential.
+ * A caller now says WHO, and the chassis alone decides where that lands.
+ */
+export async function resolveLeadEmail(leadId, { pb: pbCall }) {
+  if (!leadId) return refuse('lead_required');
+  let lead;
+  try {
+    lead = await pbCall('GET', `/api/collections/leads/records/${encodeURIComponent(leadId)}`);
+  } catch (e) {
+    if (e.status === 404) return refuse('lead_unknown');
+    throw e;
+  }
+  const to = String(lead.email ?? '').trim();
+  if (!EMAIL_RE.test(to)) return refuse('no_email');
+  return { to, idioma: locale(lead.idioma), lead };
+}
+
+/**
  * Resolve a template send for a lead: {to, subject, text, idioma, plantilla,
  * values} when it may go out, {code, status, vars} when it may not.
  */
