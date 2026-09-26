@@ -180,6 +180,9 @@ stops being recorded.
   state back from `ContentAndApprovals`, PATCHes only what changed (state and
   `content_motivo` from Meta's `rejection_reason`) and answers
   `{ok, updated:[{clave, content_estado, content_estado_en, …}], checked}`.
+  The chassis also runs it itself, 30 s after boot and then every
+  `CONTENT_SYNC_MINUTES` (default 60, `0` disables), logging `content.synced`
+  only when a row changed.
 - `GET /baja?lead=&t=` — the opt-out link from the email footer (`t` =
   HMAC-SHA256 of the lead id). GET only shows a one-button page (mail
   scanners follow every link; a scanner must never opt a lead out);
@@ -309,7 +312,9 @@ the auth collection the app signs in against) and `PB_STAFF_ROLES` (default
 public origin, e.g. `https://api.brotea.dev` — it goes into every
 `StatusCallback` and is what the callback signature is computed over),
 `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM` (with or
-without the `whatsapp:` prefix; normalised). `PUBLIC_URL` is also the origin
+without the `whatsapp:` prefix; normalised), `CONTENT_SYNC_MINUTES` (how
+often the approval states are read back; default 60, floored at 1, `0` or a
+non-number disables it). `PUBLIC_URL` is also the origin
 of the `/baja` and `/si` links. Optional `BAJA_SECRET` signs both the opt-out
 and the opt-in links (falls back to `OUTBOUND_SECRET`).
 

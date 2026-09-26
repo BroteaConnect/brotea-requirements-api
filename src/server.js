@@ -7,7 +7,7 @@ import { assignWebLead } from './assign.js';
 import { t } from './copy.js';
 import { twilioCaller, validSignature, whatsappAddress } from './twilio.js';
 import { applyTwilioStatus, sendWhatsapp } from './whatsapp.js';
-import { submitContent, syncContent } from './content.js';
+import { contentSyncEveryMs, startContentSync, submitContent, syncContent } from './content.js';
 import { bajaUrl, grantByEmail, revokeByEmail, validBajaToken, validSiToken } from './consent.js';
 import { bajaPage, siPage } from './baja.js';
 import { STAFF_ROLES, authorize, verifyUserToken } from './auth.js';
@@ -632,8 +632,20 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => console.log(`requirements-api listening on :${PORT}`));
 
+// Approval states come back by themselves: nobody has to call /content/sync.
+// CONTENT_SYNC_MINUTES (default 60); 0 or a non-number disables it.
+const CONTENT_SYNC_EVERY_MS = contentSyncEveryMs(process.env.CONTENT_SYNC_MINUTES);
+const stopContentSync = contentConfigured() && pbConfigured() && CONTENT_SYNC_EVERY_MS > 0
+  ? startContentSync({
+    everyMs: CONTENT_SYNC_EVERY_MS,
+    run: () => syncContent({ quiet: true }, { pb, twilio, logEvent: logChassis }),
+    onError: (e) => console.error('scheduled content sync failed:', e?.message ?? String(e)),
+  })
+  : () => {};
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.once(sig, () => {
+    stopContentSync();
     server.close(() => pool.end().then(() => process.exit(0)));
   });
 }
