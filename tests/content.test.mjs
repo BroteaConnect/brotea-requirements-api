@@ -201,3 +201,26 @@ test('sync with a clave reads one row; nothing changed → empty updated; a prov
   assert.equal(down.body.error.class, 'provider_unavailable');
   assert.equal(logEvent.events[0].type, 'content.sync_failed');
 });
+
+test('a quiet sync that changed nothing logs no content.synced; the manual one still does', async () => {
+  const rows = [{ ...row, id: 'pl1', content_sid: HX_ES, content_estado: 'approved' }];
+  const same = () => fakeTwilio([listing([{ sid: HX_ES, approval_requests: { status: 'approved' } }])]);
+  const quiet = fakeEvents();
+  const out = await syncContent({ quiet: true }, { pb: fakePb({ plantillas: rows }), twilio: same(), logEvent: quiet });
+  assert.deepEqual(out.body, { ok: true, updated: [], checked: 1 });
+  assert.deepEqual(quiet.events, []);
+  const manual = fakeEvents();
+  await syncContent({}, { pb: fakePb({ plantillas: rows }), twilio: same(), logEvent: manual });
+  assert.deepEqual(manual.events, [{ type: 'content.synced', payload: { updated: [], checked: 1 } }]);
+});
+
+test('a quiet sync logs content.synced when a row changed, and content.sync_failed always', async () => {
+  const pb = fakePb({ plantillas: [{ ...row, id: 'pl1', content_sid: HX_ES, content_estado: 'pending' }] });
+  const logEvent = fakeEvents();
+  await syncContent({ quiet: true }, { pb, twilio: fakeTwilio([listing([{ sid: HX_ES, approval_requests: { status: 'approved' } }])]), logEvent });
+  assert.equal(pb.row('plantillas', 'pl1').content_estado, 'approved');
+  assert.deepEqual(logEvent.events, [{ type: 'content.synced', payload: { updated: [{ clave: 'visita.confirmacion', content_estado: 'approved', content_estado_en: null }], checked: 1 } }]);
+  const failed = fakeEvents();
+  await syncContent({ quiet: true }, { pb, twilio: fakeTwilio([{ error: new Error('timeout') }]), logEvent: failed });
+  assert.deepEqual(failed.of('content.sync_failed').length, 1);
+});

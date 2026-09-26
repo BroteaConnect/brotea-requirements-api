@@ -158,8 +158,10 @@ async function readApprovals(twilio) {
 /**
  * Read the approval state of every submitted row (or of one `clave`) back
  * from Twilio and PATCH only the rows whose state or reason changed.
+ * `quiet` (the scheduled run) skips `content.synced` when nothing changed,
+ * so an hourly timer does not flood `events`; a failure always logs.
  */
-export async function syncContent({ clave } = {}, { pb, twilio, logEvent }) {
+export async function syncContent({ clave, quiet = false } = {}, { pb, twilio, logEvent }) {
   const filter = clave ? `canal = "whatsapp" && clave = ${pbQuote(clave)}` : 'canal = "whatsapp"';
   const found = await pb('GET', `${records('plantillas')}?perPage=200&filter=${encodeURIComponent(filter)}`);
   const rows = (found?.items ?? []).filter((r) => r.content_sid || r.content_sid_en);
@@ -190,6 +192,48 @@ export async function syncContent({ clave } = {}, { pb, twilio, logEvent }) {
       ...('content_motivo_en' in patch ? { content_motivo_en: patch.content_motivo_en } : {}),
     });
   }
-  await logEvent('content.synced', { updated: updated.map(({ clave: c, content_estado, content_estado_en }) => ({ clave: c, content_estado, content_estado_en })), checked: rows.length });
+  if (!quiet || updated.length) {
+    await logEvent('content.synced', { updated: updated.map(({ clave: c, content_estado, content_estado_en }) => ({ clave: c, content_estado, content_estado_en })), checked: rows.length });
+  }
   return { status: 200, body: { ok: true, updated, checked: rows.length } };
+}
+
+const DEFAULT_TIMERS = { setTimeout, setInterval, clearTimeout, clearInterval };
+
+/**
+ * CONTENT_SYNC_MINUTES as milliseconds, or 0 when the sync is off. Unset or
+ * blank is 60; 0, a negative or a non-number disables it. Clamped to at least
+ * one minute (a typo must not list Twilio back to back) and at most 2^31-1 ms,
+ * past which Node fires every 1 ms.
+ */
+export function contentSyncEveryMs(raw) {
+  const minutes = Number(String(raw ?? '').trim() || 60);
+  if (!(minutes > 0)) return 0;
+  return Math.min(Math.max(minutes, 1) * 60_000, 2 ** 31 - 1);
+}
+
+/**
+ * Run `run()` once `bootDelayMs` after boot, then every `everyMs`, so
+ * approval states come back without anyone calling /content/sync. A tick
+ * while a run is still in flight is skipped, never stacked; a throw or a
+ * rejection goes to `onError` and the next tick runs as usual. Timers are
+ * unref'd: the scheduler never keeps the process alive. Returns stop().
+ */
+export function startContentSync({ everyMs, run, onError = () => {}, bootDelayMs = 30_000, timers = DEFAULT_TIMERS }) {
+  let running = false;
+  let interval = null;
+  const unref = (h) => { if (typeof h?.unref === 'function') h.unref(); return h; };
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try { await run(); } catch (e) { try { onError(e); } catch { /* onError never crashes the process either */ } } finally { running = false; }
+  };
+  const boot = unref(timers.setTimeout(() => {
+    tick();
+    interval = unref(timers.setInterval(tick, everyMs));
+  }, bootDelayMs));
+  return () => {
+    timers.clearTimeout(boot);
+    if (interval) timers.clearInterval(interval);
+  };
 }
